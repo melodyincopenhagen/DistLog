@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod *)",
+      "Bash(make build *)",
+      "Bash(./bin/distlog)",
+      "Bash(make test *)",
+      "Bash(go get *)",
+      "Bash(go test *)",
+      "Bash(go vet *)",
+      "Bash(go build *)"
+    ]
+  }
+}

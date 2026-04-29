@@ -161,6 +161,17 @@ type SealedSegment struct {
 func (s *SealedSegment) ID() SegmentID { return s.id }
 func (s *SealedSegment) Path() string  { return s.path }
 
+// NewSealedSegmentView returns a read-only view of an existing segment file
+// without registering it with any Manager. Intended for recovery code that
+// needs to Replay the currently-active segment file (which the Manager is
+// still appending to) without taking ownership of the writer.
+//
+// The returned view holds no file descriptor; Replay opens the file on
+// demand. Calling Delete on a view of a still-active segment is undefined.
+func NewSealedSegmentView(dir string, id SegmentID) *SealedSegment {
+	return &SealedSegment{id: id, path: segmentPath(dir, id)}
+}
+
 // Replay reads every record in the segment in order and invokes fn for each.
 // If a record is corrupt or truncated (a torn tail from a crash mid-write),
 // Replay stops at that point and returns nil — preceding records are the
@@ -319,6 +330,32 @@ func (m *Manager) Close() error {
 
 // Dir returns the WAL directory path.
 func (m *Manager) Dir() string { return m.dir }
+
+// SimulateAbruptShutdownForTest closes the underlying file handle of the
+// currently active segment without going through any cleanup path. After
+// calling this, the Manager is in an undefined state and must not be used
+// for further operations. Used to simulate the file-handle state after a
+// SIGKILL in recovery tests — the on-disk content is whatever the last
+// successful Append left there, with no graceful close.
+//
+// PRODUCTION CODE MUST NOT CALL THIS.
+func (m *Manager) SimulateAbruptShutdownForTest() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active == nil {
+		return nil
+	}
+	w := m.active
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	if w.f != nil {
+		err := w.f.Close()
+		w.f = nil
+		return err
+	}
+	return nil
+}
 
 // === Helpers ===
 

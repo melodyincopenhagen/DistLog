@@ -193,3 +193,219 @@ future grep finds it.
   point change.
 
 ---
+
+## ADR-007: Corrupted SSTable Quarantine Policy
+
+- **Status**: Accepted
+- **Date**: 2026-04-28
+- **Applies to**: `internal/engine` Open path.
+
+### Context
+
+When the engine opens, it scans the data directory for SSTable files and
+loads them. Some of those files may be corrupt (bad CRC, bad magic,
+truncated). Three policies were considered:
+
+1. Fail the Open call: forces operator intervention before service can
+   resume.
+2. Delete the corrupt file: simple, but irreversible.
+3. Quarantine the corrupt file to a `corrupted/` subdirectory: keeps
+   forensic evidence while letting the service continue.
+
+### Decision
+
+Quarantine to `dataDir/corrupted/`:
+
+- The corrupt SSTable is **moved** (not copied) via `os.Rename` so the
+  primary directory no longer contains it.
+- The engine records the count in `RecoveryReport.SSTablesQuarantined`
+  and exposes it via `Stats().CorruptedSSTablesQuarantined`. Day 22 will
+  expose this as a Prometheus metric.
+- A successful quarantine (move) lets Open succeed. Recovery proceeds
+  with the remaining valid SSTables.
+- A failed quarantine (cannot create `corrupted/`, cannot rename) makes
+  Open **fail**. This is one of the few "hard error at startup" cases:
+  if the disk cannot tolerate a directory create or rename, the engine
+  cannot reliably continue.
+
+### Out of scope: partial recovery
+
+We do not attempt to extract still-valid records from a partially-
+corrupt SSTable. The reasoning:
+
+- A footer-OK / data-block-corrupt SSTable is harder to handle than
+  fully corrupt: which docID ranges are trustworthy? The metadata
+  said `MinDocID=1, MaxDocID=1000` but if a middle block is bad we
+  cannot tell which docIDs actually got persisted.
+- Partial recovery doubles the surface area of the recovery code and
+  introduces a class of "silently lost data" bugs.
+- WAL is the ground truth. If the WAL covering those docIDs has not
+  been deleted yet, replay will recover them. If it has, the data is
+  truly lost; partial SSTable recovery would not change that for the
+  ranges that lived only in the corrupted SSTable.
+
+If a future operator wants forensic recovery, they can manually inspect
+the quarantined file with a debug tool.
+
+### Consequences
+
+- Engine never silently discards data on its own; corruption is
+  preserved on disk and counted.
+- Operations: a non-zero `CorruptedSSTablesQuarantined` is a strong
+  signal of disk-level trouble (bad sectors, kernel bug, hardware
+  failure) and should page on-call.
+- The `corrupted/` directory grows over time; cleanup is an
+  operational decision, not the engine's responsibility.
+
+---
+
+## ADR-008: Fork-Self Crash Test Deferred to Week 4
+
+- **Status**: Accepted
+- **Date**: 2026-04-28
+- **Applies to**: Crash-recovery test coverage in `internal/engine`.
+
+### Context
+
+Stage D needed a "post-SIGKILL recovery" test. Two implementation
+options:
+
+- **(A)** Fork-self subprocess test: spawn a child running an Engine,
+  let it write data, then `SIGKILL` the child and reopen the engine
+  in the parent. This faithfully models a SIGKILL: all goroutines
+  terminate, all file descriptors are reclaimed by the OS, only
+  `fsync`'d state survives.
+- **(B)** "Drop the WAL handle" approximation: in a single test
+  process, call `Manager.SimulateAbruptShutdownForTest()` to close
+  the active segment's `*os.File` without going through any cleanup
+  path, then re-Open on the same dataDir.
+
+### Decision
+
+Stage D ships option (B). Option (A) is deferred to the Week 4 chaos
+test bundle (Day 21).
+
+### Rationale
+
+- (B) catches the recovery-path correctness questions Stage D needs
+  to answer: WAL replay over a non-cleanly-closed segment, docID
+  allocator resumption, SSTable rediscovery.
+- (B) costs ~30 minutes; (A) costs ~4 hours plus ongoing maintenance
+  of a test-helper binary entry point.
+- Day 21 chaos testing has a coherent story: SIGKILL, filesystem
+  errors injected, partial-write simulation. Adding the SIGKILL
+  test there bundles all crash-related testing in one place where
+  it can grow into a real chaos suite, rather than living as a
+  one-off in Stage D.
+
+### Limits of option (B)
+
+(B) does **not** model:
+
+- Goroutine termination: the freeze and flush goroutines in the
+  test process keep running after `SimulateAbruptShutdownForTest`.
+  They will hit IO errors on their next operation but stay live;
+  the engine's fatal-state path may or may not trigger depending on
+  timing.
+- Page cache loss: a real SIGKILL preserves anything that was
+  fsync'd; the OS page cache for the dead process is reclaimed, so
+  re-Open reads from disk fresh. In option (B) the page cache is
+  shared with the test process and may give an unrealistically
+  optimistic view of "what survived".
+
+These gaps are exactly what Day 21's option (A) test is meant to
+close.
+
+### Consequences
+
+- The Stage D test `TestRecovery_FromAbruptShutdown` is real but
+  not exhaustive. Its name acknowledges the limitation in its doc
+  string.
+- Day 21 chaos plan must include a fork-self SIGKILL test as a
+  first-class deliverable, not as a stretch goal.
+
+---
+
+## ADR-009: Backpressure Semantics Under Sustained Flush Stall
+
+- **Status**: Proposed (resolution deferred to Stage E)
+- **Date**: 2026-04-28
+- **Applies to**: `internal/engine` Write path and freeze coordinator.
+
+### Context
+
+Identified during the Stage D wrap-up audit. The current Stage C
+backpressure implementation has a real gap: when `len(e.frozen) >=
+MaxFrozenMemTables`, `doFreeze` returns without rotating, but **the
+write path is not gated**. Concrete sequence:
+
+1. Flush stalls (e.g. disk slow, hook gates flush in tests).
+2. `e.active` reaches `MemTableSizeLimit`. `maybeTriggerFreeze` sends
+   on `freezeCh`.
+3. `doFreeze` wakes, sees `len(frozen) >= MaxFrozenMemTables`, returns.
+4. Next Write succeeds — `e.active` is the same MemTable, `Put` works
+   on a frozen=false MemTable, size grows past the limit.
+5. `maybeTriggerFreeze` keeps signaling; `doFreeze` keeps bouncing.
+6. `e.active` grows without bound; OOM is the only stop.
+
+The Stage C `TestBackpressure_FreezeWaitsForFlush` test asserts the
+right thing about the frozen list (cap not exceeded) but never looks
+at the active MemTable's size, so this gap was missed.
+
+### Options
+
+**Option A — Hard limit with stall.** Add a `MemTableHardLimit`
+config field. When `e.active.SizeBytes() >= MemTableHardLimit` AND
+`len(e.frozen) >= MaxFrozenMemTables`, the write path stalls.
+Sub-questions:
+
+- *Block or fail-fast?* Probably "block on Write(ctx) until gate
+  opens or ctx expires; on ctx expiry return ErrBackpressure". Single
+  signature serves both fail-fast (short ctx) and patient (long ctx)
+  callers. RocksDB's write stall is roughly this shape.
+- *Default for MemTableHardLimit?* The naive
+  `MemTableSizeLimit × MaxFrozenMemTables` lets active grow up to
+  ~MaxFrozenMemTables × the per-table limit before stalling, which
+  pushes peak memory to roughly `(MaxFrozenMemTables + 1) ×
+  MemTableSizeLimit`. That conflicts with the user's likely
+  intuition that `MaxFrozenMemTables` caps memory at
+  `MaxFrozenMemTables × MemTableSizeLimit`. Pick a default that
+  makes the memory ceiling predictable from existing config fields,
+  not surprising.
+- *Wait primitive?* `sync.Cond` on a guard mutex, signaled by
+  `flushOneIfAny` Phase 6 when frozen drains. `time.NewTimer`-driven
+  ctx watchdog wakes the wait if ctx expires.
+
+**Option B — Document non-blocking semantics.** Engine never blocks
+Write; the operator is responsible for monitoring
+`Stats().FrozenMemTableCount + ActiveMemTableSize` and applying flow
+control upstream. Simple and Kafka-broker-shaped, but pushes a hard
+correctness problem onto every caller.
+
+### Recommendation
+
+Lean toward Option A in the "ctx-driven block-or-error" form. It
+gives callers control over their own latency tolerance without
+sacrificing the engine's ability to protect itself.
+
+### Open implementation questions for Stage E
+
+- How does the test inject a "permanently stalled flush" without
+  using `flushHook`? `flushHook` is currently a private field;
+  Stage E may need a more principled wait primitive.
+- Should `MemTableHardLimit` default to a fixed multiple of
+  `MemTableSizeLimit` (e.g. 2×) rather than scaling with
+  `MaxFrozenMemTables`?
+- Existing `TestBackpressure_FreezeWaitsForFlush` should be
+  extended (or duplicated) to assert active-MemTable bounded
+  growth under stall.
+
+### Related Stage E task
+
+`Write` path under WAL append failure currently propagates the error
+but is not tested for "engine is still healthy after the failure;
+the next Write does not panic and does not corrupt MemTable state".
+Pure test work, no design implications, but should land in the same
+Stage E commit as the backpressure fix.
+
+---

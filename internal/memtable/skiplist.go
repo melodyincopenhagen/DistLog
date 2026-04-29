@@ -100,13 +100,17 @@ func (m *skipMemTable) Iterator() Iterator {
 	}
 }
 
+// skipIterator is an in-memory iterator over the skiplist. It implements
+// iter.Iterator. Because every operation is in-memory, Err() always returns
+// nil — the field exists only to satisfy the shared interface used by
+// SSTable iterators (where I/O can fail mid-iteration).
 type skipIterator struct {
 	parent  *skipMemTable
 	cur     *skiplist.Element
 	next    *skiplist.Element
 	started bool
 	closed  bool
-	err     error
+	err     error // always nil; see type doc
 }
 
 func (it *skipIterator) Next() bool {

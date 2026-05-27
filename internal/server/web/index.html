@@ -13,18 +13,28 @@
 
   <section id="health-panel">
     <h2>Engine status <span id="health-status" class="badge">…</span></h2>
-    <table id="health-table">
-      <tbody>
-        <tr><th>SSTables</th><td id="h-sstable_count">—</td></tr>
-        <tr><th>Frozen MemTables</th><td id="h-frozen_memtable_count">—</td></tr>
-        <tr><th>Active MemTable</th><td id="h-active_memtable_size">—</td></tr>
-        <tr><th>Next DocID</th><td id="h-next_doc_id">—</td></tr>
-        <tr><th>Last scan pruned SSTables</th><td id="h-last_scan_pruned_sstables">—</td></tr>
-        <tr><th>Corrupted quarantined</th><td id="h-corrupted_sstables_quarantined">—</td></tr>
-        <tr><th>Fatal</th><td id="h-fatal">—</td></tr>
-      </tbody>
-    </table>
-    <p class="hint">Auto-refreshes every 2 seconds.</p>
+    <div class="health-grid">
+      <table id="health-table">
+        <tbody>
+          <tr><th>SSTables</th><td id="h-sstable_count">—</td></tr>
+          <tr><th>Frozen MemTables</th><td id="h-frozen_memtable_count">—</td></tr>
+          <tr><th>Active MemTable</th><td id="h-active_memtable_size">—</td></tr>
+          <tr><th>Next DocID</th><td id="h-next_doc_id">—</td></tr>
+          <tr><th>Last scan pruned SSTables</th><td id="h-last_scan_pruned_sstables">—</td></tr>
+          <tr><th>Corrupted quarantined</th><td id="h-corrupted_sstables_quarantined">—</td></tr>
+          <tr><th>Fatal</th><td id="h-fatal">—</td></tr>
+        </tbody>
+      </table>
+      <div class="chart-wrap">
+        <canvas id="health-chart" width="520" height="180"></canvas>
+        <div class="legend">
+          <span class="legend-item"><span class="dot" style="background:var(--accent)"></span>active MemTable (KiB)</span>
+          <span class="legend-item"><span class="dot" style="background:var(--ok)"></span>writes/s</span>
+          <span class="legend-item"><span class="dot" style="background:var(--warn)"></span>SSTables pruned (last scan)</span>
+        </div>
+      </div>
+    </div>
+    <p class="hint">Auto-refreshes every 2 s while visible; drops to 30 s when tab is hidden.</p>
   </section>
 
   <section id="ingest-panel">
@@ -52,7 +62,10 @@
       <button class="sample" data-sql="SELECT message FROM logs WHERE ts >= '2026-01-01T00:00:00Z' AND ts <= '2026-12-31T23:59:59Z' LIMIT 50">in 2026</button>
     </div>
     <form id="query-form">
-      <textarea name="sql" rows="4" required>SELECT * FROM logs LIMIT 20</textarea>
+      <div class="sql-editor">
+        <pre class="sql-hl" id="sql-hl" aria-hidden="true"></pre>
+        <textarea name="sql" id="sql-input" rows="4" required spellcheck="false">SELECT * FROM logs LIMIT 20</textarea>
+      </div>
       <button type="submit">Run</button>
     </form>
     <p id="query-status" class="hint"></p>

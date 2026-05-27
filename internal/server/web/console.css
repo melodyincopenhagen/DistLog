@@ -8,6 +8,9 @@
   --ok: #4dd99a;
   --warn: #ffc66b;
   --err: #ff6b81;
+  --string: #ecc48d;
+  --keyword: #c792ea;
+  --number: #f78c6c;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
@@ -125,6 +128,107 @@ td { font-family: var(--mono); }
 .result.ok { border-left: 3px solid var(--ok); }
 .result.err { border-left: 3px solid var(--err); }
 
+/* === Health panel layout === */
+
+.health-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 24px;
+  align-items: start;
+}
+.health-grid #health-table th { width: 180px; }
+
+.chart-wrap {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+#health-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.legend {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.legend .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block;
+}
+
+@media (max-width: 800px) {
+  .health-grid { grid-template-columns: 1fr; }
+}
+
+/* === Query result table === */
+
 #query-result table { margin-top: 8px; }
-#query-result th { color: var(--accent); width: auto; }
-#query-result td { font-size: 12px; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#query-result th {
+  color: var(--accent);
+  width: auto;
+  cursor: pointer;
+  user-select: none;
+}
+#query-result th:hover { color: var(--text); }
+#query-result th .sort-mark {
+  color: var(--muted);
+  font-size: 10px;
+  margin-left: 4px;
+}
+#query-result td {
+  font-size: 12px;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* === SQL editor (textarea + highlighting layer overlay) === */
+
+.sql-editor {
+  position: relative;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+  margin-bottom: 8px;
+}
+.sql-editor textarea,
+.sql-editor .sql-hl {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.sql-editor textarea {
+  position: relative;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--text);
+  z-index: 2;
+  resize: vertical;
+  /* Selection still visible over the highlight layer. */
+}
+.sql-editor textarea::selection { background: rgba(130, 170, 255, 0.35); }
+.sql-editor .sql-hl {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: var(--bg);
+  color: var(--text);
+}
+.sql-hl .kw { color: var(--keyword); font-weight: 600; }
+.sql-hl .str { color: var(--string); }
+.sql-hl .num { color: var(--number); }
+.sql-hl .op  { color: var(--accent); }

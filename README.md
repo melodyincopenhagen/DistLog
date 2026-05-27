@@ -25,7 +25,8 @@ The single-node service is operational and tested end-to-end via HTTP. Specifica
 - **HTTP server** ([`internal/server`](internal/server/)) — `POST /ingest`, `GET /logs/{docID}`, `POST /query`, `GET /healthz`; `ErrBackpressure → 429 + Retry-After`, `ErrClosed → 503`, `ErrEngineFatal → 500`; unknown-field rejection on JSON input; RFC3339-with-nanos timestamp output.
 - **Engine scan API** ([`internal/engine`](internal/engine/) `Scan`) — k-way merge over active MemTable + frozen MemTables + SSTables via `container/heap`, ascending DocID with source-priority tie-break for duplicates that briefly exist during flush. Powers the query executor.
 - **SQL parser** ([`internal/query`](internal/query/)) — `participle`-based grammar for `SELECT [cols|*] FROM logs [WHERE expr] [LIMIT N]`. WHERE expression supports `=` / `!=`, `AND` / `OR`, parentheses, and these fields: `ts`, `doc_id`, `tenant_id`, `source`, `message`, `fields.<key>`. Timestamp literals are RFC3339; comparison normalizes to unix-nanos.
-- **Query executor** ([`internal/query`](internal/query/)) — full-table scan + filter + project + LIMIT. Aborts the underlying engine scan once LIMIT is reached (internal sentinel error, translated back to a clean return). No inverted-index pushdown, no ORDER BY — those are explicit next stages.
+- **Query executor** ([`internal/query`](internal/query/)) — scan + filter + project + LIMIT. Aborts the underlying engine scan once LIMIT is reached (internal sentinel error, translated back to a clean return).
+- **Timestamp predicate pushdown** ([`internal/query`](internal/query/) Plan) — extracts `ts =`, `ts <`, `ts <=`, `ts >`, `ts >=` bounds from the top-level AND chain of WHERE and passes them to `engine.ScanWithOptions`. SSTables whose meta-block min/max timestamp falls outside the requested window are pruned without opening their data blocks. Conservative-by-default: any OR at the top level disables pushdown so we never drop a valid SSTable. In the bundled benchmark (20k records, 23 SSTables, query targeting ~5% of the time range), pushdown prunes 19/23 SSTables and reduces query latency from 44 ms to 7.7 ms — see [Benchmarks](#benchmarks).
 - **Server binary** ([`cmd/distlog`](cmd/distlog/)) — loads config, opens engine, serves HTTP, handles SIGINT/SIGTERM for graceful shutdown.
 
 What that adds up to: a durable, recoverable, single-process log store you can `curl` ingest into and run small SQL queries against.
@@ -38,7 +39,6 @@ The following are stubs (empty directory) or absent:
 |----------------------------------------|-------------------|
 | Inverted index / full-text `MATCH`     | Not started       |
 | `ORDER BY`, `GROUP BY`, aggregations   | Not started       |
-| Predicate pushdown (ts-range pruning)  | Not started       |
 | gRPC API                               | Not started       |
 | Client SDK                             | Not started       |
 | Raft replication                       | Not started       |
@@ -108,6 +108,7 @@ SELECT * | <col> [, <col>]* FROM logs
   [LIMIT <n>]
 
 <expr> := <field> ('=' | '!=') <literal>
+        | <field> ('<' | '<=' | '>' | '>=') <literal>   -- numeric fields only
         | <expr> 'AND' <expr>
         | <expr> 'OR' <expr>
         | '(' <expr> ')'
@@ -166,6 +167,28 @@ go test -race ./...      # data-race detector
 
 The `Makefile` has additional targets (`lint`, `test-int`, `test-chaos`, `cluster-up`) — `lint` requires `golangci-lint`, and the cluster targets reference files that do not exist yet.
 
+## Benchmarks
+
+Run with `go test -bench=. -benchmem -run=^$ ./internal/{engine,query}/`. Numbers below are from an Apple M4 (10-core, macOS, gp3-equivalent local SSD); reproduce yours with the same command. Treat these as relative ballpark figures, not vendor-comparable claims.
+
+**Engine** ([`internal/engine/bench_test.go`](internal/engine/bench_test.go), `MemTableSizeLimit=256 KiB` to force flushes mid-run):
+
+| Bench                          | Result                                       |
+|--------------------------------|----------------------------------------------|
+| `Write`                        | ~7.2 µs/op (~140k writes/sec, single-thread) |
+| `Get` — active MemTable hit    | ~14 ns/op                                    |
+| `Get` — SSTable hit            | ~93 µs/op (read block + binary search + JSON decode) |
+| `Scan` — full table, 20k recs  | ~446k records/sec                            |
+
+**Timestamp predicate pushdown** ([`internal/query/bench_test.go`](internal/query/bench_test.go), 20k records seeded into 20 disjoint ts buckets producing 23 SSTables; query targets a ~5% window):
+
+| Bench                           | Latency   | SSTables scanned | SSTables pruned |
+|---------------------------------|-----------|------------------|-----------------|
+| `TsPushdown/with_pushdown`      | ~7.7 ms   | 4 / 23           | 19              |
+| `TsPushdown/without_pushdown`   | ~44 ms    | 23 / 23          | 0               |
+
+A ~5.8× speedup is consistent with «pruning eliminates 83% of block reads», not a hot-loop micro-optimization. The without-pushdown variant uses an `OR` in WHERE to suppress the planner (per the conservative pushdown rule); both variants return the same rows.
+
 ## Design documents
 
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — ADRs covering byte order, SSTable format v1, fsync semantics on macOS vs Linux, SSTable reader strategy, corrupted-SSTable quarantine, fork-self crash test deferral, and backpressure (ADR-009).
@@ -183,7 +206,8 @@ Each stage is a coherent commit-set, not a calendar week.
 - [x] **Stage E** — write-side backpressure under sustained flush stall (ADR-009)
 - [x] **Stage F** — config loader + HTTP server + working `cmd/distlog` binary
 - [x] **Stage G** — `engine.Scan` k-way merge + minimal SQL parser/executor + `POST /query`
-- [ ] **Next** — likely `WHERE ts BETWEEN ...` predicate pushdown using SSTable meta-block timestamp ranges, then the start of an inverted index for `MATCH`
+- [x] **Stage H** — `ts` predicate pushdown (planner extracts AND-chain bounds; engine prunes SSTables by meta-block min/max timestamp) + benchmark suite
+- [ ] **Next** — likely inverted index for `MATCH`, or `ORDER BY ts DESC LIMIT N` with TopK min-heap
 
 ## Contributing
 

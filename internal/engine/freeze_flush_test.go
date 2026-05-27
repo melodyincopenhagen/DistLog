@@ -31,8 +31,8 @@ func makeBigPayload(i int) *types.LogRecord {
 	}
 }
 
-func waitFor(t *testing.T, cond func() bool, timeout time.Duration, msg string) {
-	t.Helper()
+func waitFor(tb testing.TB, cond func() bool, timeout time.Duration, msg string) {
+	tb.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {
@@ -40,7 +40,7 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration, msg string) 
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("timeout waiting for: %s", msg)
+	tb.Fatalf("timeout waiting for: %s", msg)
 }
 
 // === Freeze + Flush round-trip ===

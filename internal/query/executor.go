@@ -5,14 +5,20 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/yuexishen/distlog/internal/engine"
 	"github.com/yuexishen/distlog/internal/types"
 )
 
 // Scanner is the subset of *engine.Engine the executor depends on.
 // Defined here (not in engine) so the executor can be tested with a
 // fake scanner without spinning up a real engine.
+//
+// ScanWithOptions accepts pushdown hints (currently just ts-range).
+// Implementations are free to ignore hints — the executor re-applies
+// the predicate on every emitted record anyway, so hints are an
+// optimization, not a correctness boundary.
 type Scanner interface {
-	Scan(ctx context.Context, visit func(types.DocID, *types.LogRecord) error) error
+	ScanWithOptions(ctx context.Context, opts engine.ScanOptions, visit func(types.DocID, *types.LogRecord) error) error
 }
 
 // Row is one result record. Fields holds the projected columns, keyed
@@ -50,7 +56,8 @@ func Execute(ctx context.Context, s Scanner, stmt *Statement) (*Result, error) {
 		limit = *stmt.Limit
 	}
 
-	err = s.Scan(ctx, func(id types.DocID, rec *types.LogRecord) error {
+	opts := Plan(stmt)
+	err = s.ScanWithOptions(ctx, opts, func(id types.DocID, rec *types.LogRecord) error {
 		match, err := Eval(stmt.Where, id, rec)
 		if err != nil {
 			return err

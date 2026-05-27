@@ -223,6 +223,12 @@ type Engine struct {
 	// write lock during flush completion.
 	nextSSTSeq atomic.Uint64
 
+	// Number of SSTables pruned by the most recent ScanWithOptions
+	// call. Single-writer (the next Scan overwrites) so no
+	// synchronization beyond the atomic. Exposed via
+	// PrunedSSTablesForTest for benchmarks and tests.
+	lastScanPrunedSSTables atomic.Int64
+
 	// Background goroutine plumbing.
 	freezeCh     chan struct{}
 	flushCh      chan struct{}
@@ -275,6 +281,13 @@ type Stats struct {
 	NextDocID                    types.DocID
 	Fatal                        bool
 	Closed                       bool
+
+	// LastScanPrunedSSTables is how many SSTables the most recent
+	// ScanWithOptions call skipped via time-range pushdown. Useful
+	// for both /healthz observability and ts-pushdown benchmarks.
+	// Single-writer (each scan overwrites), so the value is the
+	// most recent scan's result, not a sum across scans.
+	LastScanPrunedSSTables int
 }
 
 // Open creates or reopens an Engine rooted at cfg.DataDir.
@@ -597,6 +610,51 @@ func (e *Engine) Get(docID types.DocID) (*types.LogRecord, bool, error) {
 	return nil, false, nil
 }
 
+// ScanOptions narrows a Scan to records whose attributes fall inside
+// the given bounds. Zero-value option fields mean "no constraint."
+//
+// The bounds are an optimization hint, not a filter — the engine MAY
+// skip whole sources whose metadata proves no record can match (e.g.
+// an SSTable whose `MaxTimestamp < MinTimestamp` from options is
+// pruned wholesale), but it does NOT promise to filter every record
+// individually. Callers should re-evaluate the predicate on each
+// emitted record to get exact results.
+type ScanOptions struct {
+	// MinTimestamp, MaxTimestamp constrain emitted records to a
+	// timestamp range. If both are zero the constraint is absent.
+	// If only Min is set the range is [Min, +inf); only Max means
+	// (-inf, Max]. Range is inclusive on both ends.
+	//
+	// SSTable pruning is by meta-block min/max Timestamp (ADR-002).
+	// MemTables are not pruned because there is no per-MemTable
+	// timestamp bound today — pruning at that layer would need a
+	// new statistic.
+	MinTimestamp types.Timestamp
+	MaxTimestamp types.Timestamp
+}
+
+// hasTimeRange reports whether the options actually narrow the time
+// range (i.e. at least one bound is non-zero).
+func (o ScanOptions) hasTimeRange() bool {
+	return o.MinTimestamp != 0 || o.MaxTimestamp != 0
+}
+
+// pruneSSTable reports whether an SSTable's timestamp range is fully
+// outside the requested window — meaning the executor would never see
+// a matching record from it, so we can skip opening an iterator.
+func (o ScanOptions) pruneSSTable(r *sstable.Reader) bool {
+	if !o.hasTimeRange() {
+		return false
+	}
+	if o.MinTimestamp != 0 && r.MaxTimestamp() < o.MinTimestamp {
+		return true
+	}
+	if o.MaxTimestamp != 0 && r.MinTimestamp() > o.MaxTimestamp {
+		return true
+	}
+	return false
+}
+
 // Scan visits every distinct DocID currently in the engine, in ascending
 // DocID order. When the same DocID exists in multiple sources (active,
 // frozen, SSTable) — which can briefly happen while a flush is in
@@ -615,6 +673,12 @@ func (e *Engine) Get(docID types.DocID) (*types.LogRecord, bool, error) {
 // (Sound reference-counted snapshots are deferred until they become
 // load-bearing.)
 func (e *Engine) Scan(ctx context.Context, visit func(types.DocID, *types.LogRecord) error) error {
+	return e.ScanWithOptions(ctx, ScanOptions{}, visit)
+}
+
+// ScanWithOptions is Scan with optional pushdown hints. The base Scan
+// is preserved as a zero-options shorthand for the common case.
+func (e *Engine) ScanWithOptions(ctx context.Context, opts ScanOptions, visit func(types.DocID, *types.LogRecord) error) error {
 	if e.closed.Load() {
 		return ErrClosed
 	}
@@ -627,6 +691,11 @@ func (e *Engine) Scan(ctx context.Context, visit func(types.DocID, *types.LogRec
 	frozen := append([]memtable.MemTable(nil), e.frozen...)
 	sstables := append([]*sstable.Reader(nil), e.sstables...)
 	e.mu.RUnlock()
+
+	// Record how many SSTables we pruned this scan. Tests + benchmarks
+	// observe this via PrunedSSTablesForTest; production cost is one
+	// atomic store per scan.
+	pruned := 0
 
 	// Build cursors in priority order: lower priority value = higher
 	// precedence (wins ties on duplicate DocID).
@@ -649,9 +718,15 @@ func (e *Engine) Scan(ctx context.Context, visit func(types.DocID, *types.LogRec
 		prio++
 	}
 	for _, sst := range sstables {
+		if opts.pruneSSTable(sst) {
+			pruned++
+			prio++
+			continue
+		}
 		addCursor(sst.Iterator(), prio)
 		prio++
 	}
+	e.lastScanPrunedSSTables.Store(int64(pruned))
 	defer func() {
 		for _, c := range cursors {
 			_ = c.it.Close()
@@ -824,6 +899,7 @@ func (e *Engine) Stats() Stats {
 		NextDocID:                    e.alloc.Peek() + 1,
 		Fatal:                        e.fatal.Load(),
 		Closed:                       e.closed.Load(),
+		LastScanPrunedSSTables:       int(e.lastScanPrunedSSTables.Load()),
 	}
 }
 

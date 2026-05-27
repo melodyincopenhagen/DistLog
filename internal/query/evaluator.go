@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/yuexishen/distlog/internal/types"
@@ -68,15 +69,50 @@ func (c *Compare) eval(ctx evalCtx) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	equal := got == want
 	switch c.Op {
 	case "=":
-		return equal, nil
+		return got == want, nil
 	case "!=":
-		return !equal, nil
-	default:
-		return false, fmt.Errorf("query: unknown operator %q", c.Op)
+		return got != want, nil
+	case "<", "<=", ">", ">=":
+		// Ordered comparison: only meaningful on numeric fields. ts
+		// and doc_id are canonicalized to base-10 integer strings by
+		// loadField/loadLiteral, so we can re-parse to int64 here.
+		if !isOrderedField(c.Field) {
+			return false, fmt.Errorf("query: operator %q only supported on numeric fields (ts, doc_id), not %q",
+				c.Op, fieldDisplay(c.Field))
+		}
+		l, err := strconv.ParseInt(got, 10, 64)
+		if err != nil {
+			return false, fmt.Errorf("query: lhs not numeric: %w", err)
+		}
+		r, err := strconv.ParseInt(want, 10, 64)
+		if err != nil {
+			return false, fmt.Errorf("query: rhs not numeric: %w", err)
+		}
+		switch c.Op {
+		case "<":
+			return l < r, nil
+		case "<=":
+			return l <= r, nil
+		case ">":
+			return l > r, nil
+		case ">=":
+			return l >= r, nil
+		}
 	}
+	return false, fmt.Errorf("query: unknown operator %q", c.Op)
+}
+
+func isOrderedField(f *FieldRef) bool {
+	return f.Map == "" && (f.Name == "ts" || f.Name == "doc_id")
+}
+
+func fieldDisplay(f *FieldRef) string {
+	if f.Map != "" {
+		return f.Name + "." + f.Map
+	}
+	return f.Name
 }
 
 // loadField extracts the queried column from the record, coercing to a

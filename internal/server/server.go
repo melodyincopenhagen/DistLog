@@ -281,6 +281,7 @@ type healthResponse struct {
 	NextDocID                    uint64 `json:"next_doc_id"`
 	Fatal                        bool   `json:"fatal"`
 	Closed                       bool   `json:"closed"`
+	LastScanPrunedSSTables       int    `json:"last_scan_pruned_sstables"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -300,6 +301,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		NextDocID:                    uint64(stats.NextDocID),
 		Fatal:                        stats.Fatal,
 		Closed:                       stats.Closed,
+		LastScanPrunedSSTables:       stats.LastScanPrunedSSTables,
 	})
 }
 

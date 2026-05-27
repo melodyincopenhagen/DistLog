@@ -6,19 +6,24 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/yuexishen/distlog/internal/engine"
 	"github.com/yuexishen/distlog/internal/types"
 )
 
 // fakeScanner replays a fixed in-memory slice. Lets us test the
-// executor without spinning up a real engine.
+// executor without spinning up a real engine. lastOpts records the
+// most recent ScanOptions so planner integration tests can assert on
+// what the executor actually pushed down.
 type fakeScanner struct {
 	records []struct {
 		id  types.DocID
 		rec *types.LogRecord
 	}
+	lastOpts engine.ScanOptions
 }
 
-func (f *fakeScanner) Scan(ctx context.Context, visit func(types.DocID, *types.LogRecord) error) error {
+func (f *fakeScanner) ScanWithOptions(ctx context.Context, opts engine.ScanOptions, visit func(types.DocID, *types.LogRecord) error) error {
+	f.lastOpts = opts
 	for _, r := range f.records {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -175,6 +180,26 @@ func TestExecute_BadTimestampLiteralIsError(t *testing.T) {
 	require.NoError(t, err)
 	_, err = Execute(context.Background(), s, stmt)
 	require.Error(t, err)
+}
+
+func TestExecute_PushesDownTsRangeToScanner(t *testing.T) {
+	s := mkScanner(&types.LogRecord{Message: "x"})
+	stmt, err := Parse("SELECT * FROM logs WHERE ts >= '2026-01-01T00:00:00Z' AND ts <= '2026-12-31T23:59:59Z'")
+	require.NoError(t, err)
+	_, err = Execute(context.Background(), s, stmt)
+	require.NoError(t, err)
+	require.NotZero(t, s.lastOpts.MinTimestamp, "executor must pass planned MinTimestamp to scanner")
+	require.NotZero(t, s.lastOpts.MaxTimestamp, "executor must pass planned MaxTimestamp to scanner")
+}
+
+func TestExecute_NoPushdownWhenWhereHasNoTs(t *testing.T) {
+	s := mkScanner(&types.LogRecord{Message: "x"})
+	stmt, err := Parse("SELECT * FROM logs WHERE source = 'api'")
+	require.NoError(t, err)
+	_, err = Execute(context.Background(), s, stmt)
+	require.NoError(t, err)
+	require.Zero(t, s.lastOpts.MinTimestamp)
+	require.Zero(t, s.lastOpts.MaxTimestamp)
 }
 
 func TestExecute_UnknownFieldIsError(t *testing.T) {

@@ -74,3 +74,4 @@ func (e *Engine) ActiveSizeForTest() int64 {
 	}
 	return e.active.SizeBytes()
 }
+

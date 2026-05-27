@@ -17,10 +17,14 @@
 //	<orExpr> := <andExpr> ('OR' <andExpr>)*
 //	<andExpr>:= <cmpExpr> ('AND' <cmpExpr>)*
 //	<cmpExpr>:= '(' <expr> ')' | <field> <op> <literal>
-//	<op>     := '=' | '!='
+//	<op>     := '=' | '!=' | '<' | '<=' | '>' | '>='
 //	<field>  := 'ts' | 'tenant_id' | 'source' | 'message' | 'doc_id'
 //	          | 'fields.' IDENT
 //	<literal>:= STRING | INT | TIMESTAMP-STRING
+//
+// Ordered comparisons (<, <=, >, >=) are only meaningful on numeric
+// fields (ts, doc_id). Applying them to string fields is a runtime
+// error.
 //
 // `ts` and timestamp literals: literals are RFC3339 strings; comparisons
 // against `ts` compare unix-nanos under the hood. `doc_id` is integer.
@@ -80,7 +84,7 @@ type CmpExpr struct {
 
 type Compare struct {
 	Field *FieldRef `parser:"@@"`
-	Op    string    `parser:"@( '=' | '!' '=' )"`
+	Op    string    `parser:"@( '!' '=' | '<' '=' | '>' '=' | '=' | '<' | '>' )"`
 	Value *Literal  `parser:"@@"`
 }
 
@@ -106,7 +110,7 @@ var sqlLexer = lexer.MustSimple([]lexer.SimpleRule{
 	{Name: "Ident", Pattern: `[a-zA-Z_][a-zA-Z0-9_]*`},
 	{Name: "String", Pattern: `'(?:[^'\\]|\\.)*'`},
 	{Name: "Int", Pattern: `-?\d+`},
-	{Name: "Punct", Pattern: `[*=!.(),]`},
+	{Name: "Punct", Pattern: `[*=!<>.(),]`},
 })
 
 var parser = participle.MustBuild[Statement](

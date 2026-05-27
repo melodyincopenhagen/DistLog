@@ -1,6 +1,6 @@
 # DistLog
 
-> A distributed log search engine being built from scratch in Go. Currently a single-node storage engine (LSM-tree with WAL, MemTable, SSTable, freeze/flush pipeline, crash recovery, backpressure) fronted by a minimal HTTP server. Distributed layer, query engine, and inverted index are not yet implemented.
+> A distributed log search engine being built from scratch in Go. Currently a single-node engine (LSM-tree storage with WAL, MemTable, SSTable, freeze/flush, crash recovery, write backpressure) plus a small SQL dialect (SELECT / WHERE / LIMIT, full-scan executor) reachable over HTTP. Distributed layer, inverted index, and ORDER BY / aggregations are not yet implemented.
 
 [![Go Version](https://img.shields.io/badge/go-1.22+-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -22,29 +22,33 @@ The single-node service is operational and tested end-to-end via HTTP. Specifica
 - **Crash recovery** — on `Open`, replays WAL segments (skipping records already covered by SSTables), quarantines corrupted SSTables to `dataDir/corrupted/` instead of failing or silently dropping them (ADR-007), and rebuilds the docID allocator monotonically.
 - **Backpressure** (ADR-009) — under sustained flush stall, `Engine.Write` blocks once the active MemTable reaches `MemTableHardLimit` (default 2× `MemTableSizeLimit`) and the frozen queue is full. Block is bounded by `ctx`; on expiry the call returns `errors.Join(ErrBackpressure, ctx.Err())`. Engine stays healthy and resumes serving once flush drains.
 - **YAML config** ([`internal/config`](internal/config/)) — single typed loader; unknown fields fail loudly; defaults live in code, not YAML. See [`configs/dev.yaml`](configs/dev.yaml).
-- **HTTP server** ([`internal/server`](internal/server/)) — three endpoints (`POST /ingest`, `GET /logs/{docID}`, `GET /healthz`) with `ErrBackpressure → 429 + Retry-After`, `ErrClosed → 503`, `ErrEngineFatal → 500`, unknown-field rejection on JSON input, RFC3339-with-nanos timestamp output.
+- **HTTP server** ([`internal/server`](internal/server/)) — `POST /ingest`, `GET /logs/{docID}`, `POST /query`, `GET /healthz`; `ErrBackpressure → 429 + Retry-After`, `ErrClosed → 503`, `ErrEngineFatal → 500`; unknown-field rejection on JSON input; RFC3339-with-nanos timestamp output.
+- **Engine scan API** ([`internal/engine`](internal/engine/) `Scan`) — k-way merge over active MemTable + frozen MemTables + SSTables via `container/heap`, ascending DocID with source-priority tie-break for duplicates that briefly exist during flush. Powers the query executor.
+- **SQL parser** ([`internal/query`](internal/query/)) — `participle`-based grammar for `SELECT [cols|*] FROM logs [WHERE expr] [LIMIT N]`. WHERE expression supports `=` / `!=`, `AND` / `OR`, parentheses, and these fields: `ts`, `doc_id`, `tenant_id`, `source`, `message`, `fields.<key>`. Timestamp literals are RFC3339; comparison normalizes to unix-nanos.
+- **Query executor** ([`internal/query`](internal/query/)) — full-table scan + filter + project + LIMIT. Aborts the underlying engine scan once LIMIT is reached (internal sentinel error, translated back to a clean return). No inverted-index pushdown, no ORDER BY — those are explicit next stages.
 - **Server binary** ([`cmd/distlog`](cmd/distlog/)) — loads config, opens engine, serves HTTP, handles SIGINT/SIGTERM for graceful shutdown.
 
-What that adds up to: a durable, recoverable, single-process log store you can `curl` into. Storage internals are real; querying is still point-lookup-by-DocID only.
+What that adds up to: a durable, recoverable, single-process log store you can `curl` ingest into and run small SQL queries against.
 
 ## What's not yet built
 
 The following are stubs (empty directory) or absent:
 
-| Component                       | Status            |
-|---------------------------------|-------------------|
-| Inverted index                  | Not started       |
-| SQL parser / query planner      | Not started       |
-| gRPC API                        | Not started       |
-| Client SDK                      | Not started       |
-| Raft replication                | Not started       |
-| Sharding & routing              | Not started       |
-| Ingester / querier binaries     | Not started       |
-| Compaction (size-tiered)        | Not started       |
-| Docker Compose / Helm chart     | Not started       |
-| Prometheus / OTel integration   | Not started       |
+| Component                              | Status            |
+|----------------------------------------|-------------------|
+| Inverted index / full-text `MATCH`     | Not started       |
+| `ORDER BY`, `GROUP BY`, aggregations   | Not started       |
+| Predicate pushdown (ts-range pruning)  | Not started       |
+| gRPC API                               | Not started       |
+| Client SDK                             | Not started       |
+| Raft replication                       | Not started       |
+| Sharding & routing                     | Not started       |
+| Ingester / querier binaries            | Not started       |
+| Compaction (size-tiered)               | Not started       |
+| Docker Compose / Helm chart            | Not started       |
+| Prometheus / OTel integration          | Not started       |
 
-There is no full-text search and no SQL. `WHERE message MATCH '...'` does not work; only `GET /logs/{docID}` by primary key.
+The current SQL executor is a full scan — every query reads every SSTable + frozen + active MemTable. Fine for the data sizes this repo currently exercises; not a production query engine.
 
 ## Quick start
 
@@ -77,6 +81,12 @@ curl -s http://localhost:8080/logs/1
 # Engine stats.
 curl -s http://localhost:8080/healthz
 # {"status":"ok","active_memtable_size":109,"frozen_memtable_count":0,...}
+
+# Run a SQL query.
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT message, source FROM logs WHERE fields.level = '\''error'\'' LIMIT 10"}'
+# {"columns":["message","source"],"rows":[{"doc_id":1,"values":{"message":"connection timeout to upstream","source":"api-1"}}]}
 ```
 
 Stop with Ctrl-C; the server drains in-flight requests and closes the engine cleanly.
@@ -87,7 +97,25 @@ Stop with Ctrl-C; the server drains in-flight requests and closes the engine cle
 |-------------------------|------------------------------------------------------------------------------------------------|
 | `POST /ingest`          | Body: single `LogRecord` JSON. `ts` accepts RFC3339 string or unix-nanos integer; omitted → now. Returns `{"doc_id": N}`. Unknown fields rejected. |
 | `GET /logs/{docID}`     | Returns the record JSON, or 404. `ts` always emitted as RFC3339 with nanos in UTC.            |
+| `POST /query`           | Body: `{"sql": "..."}`. Returns `{"columns": [...], "rows": [{"doc_id": N, "values": {...}}]}`. SQL parse errors and bad field/literal references → 400. |
 | `GET /healthz`          | Returns engine stats; `200` if healthy, `503` if engine is in fatal or closed state.          |
+
+**SQL dialect** (full-scan executor; no optimizer):
+
+```sql
+SELECT * | <col> [, <col>]* FROM logs
+  [WHERE <expr>]
+  [LIMIT <n>]
+
+<expr> := <field> ('=' | '!=') <literal>
+        | <expr> 'AND' <expr>
+        | <expr> 'OR' <expr>
+        | '(' <expr> ')'
+
+<field> := ts | doc_id | tenant_id | source | message | fields.<key>
+```
+
+Timestamp literals are RFC3339 strings (`'2026-05-26T12:00:00Z'`); comparisons against `ts` normalize both sides to unix-nanos. `fields.<key>` reads from the per-record `Fields` map.
 
 Error mapping (chosen so generic HTTP retry libraries do the right thing):
 
@@ -112,8 +140,8 @@ distlog/
 │   ├── sstable/        # immutable on-disk format + reader/writer (DONE)
 │   ├── types/          # LogRecord, DocID allocator (DONE)
 │   ├── iter/           # iterator helpers (DONE)
-│   ├── index/          # empty — planned (inverted index)
-│   ├── query/          # empty — planned (SQL parser, planner, executor)
+│   ├── query/          # SQL parser + executor (DONE for scan dialect)
+│   ├── index/          # empty — planned (inverted index for MATCH pushdown)
 │   └── raft/           # empty — planned (replication)
 ├── pkg/client/         # empty — planned (Go client SDK)
 ├── api/proto/          # empty — planned (gRPC service definitions)
@@ -154,7 +182,8 @@ Each stage is a coherent commit-set, not a calendar week.
 - [x] **Stage D** — startup recovery (WAL replay, SSTable rediscovery, quarantine, fatal-state path)
 - [x] **Stage E** — write-side backpressure under sustained flush stall (ADR-009)
 - [x] **Stage F** — config loader + HTTP server + working `cmd/distlog` binary
-- [ ] **Next** — TBD; likely the start of the inverted index, or size-tiered compaction
+- [x] **Stage G** — `engine.Scan` k-way merge + minimal SQL parser/executor + `POST /query`
+- [ ] **Next** — likely `WHERE ts BETWEEN ...` predicate pushdown using SSTable meta-block timestamp ranges, then the start of an inverted index for `MATCH`
 
 ## Contributing
 

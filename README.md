@@ -22,7 +22,8 @@ The single-node service is operational and tested end-to-end via HTTP. Specifica
 - **Crash recovery** — on `Open`, replays WAL segments (skipping records already covered by SSTables), quarantines corrupted SSTables to `dataDir/corrupted/` instead of failing or silently dropping them (ADR-007), and rebuilds the docID allocator monotonically.
 - **Backpressure** (ADR-009) — under sustained flush stall, `Engine.Write` blocks once the active MemTable reaches `MemTableHardLimit` (default 2× `MemTableSizeLimit`) and the frozen queue is full. Block is bounded by `ctx`; on expiry the call returns `errors.Join(ErrBackpressure, ctx.Err())`. Engine stays healthy and resumes serving once flush drains.
 - **YAML config** ([`internal/config`](internal/config/)) — single typed loader; unknown fields fail loudly; defaults live in code, not YAML. See [`configs/dev.yaml`](configs/dev.yaml).
-- **HTTP server** ([`internal/server`](internal/server/)) — `POST /ingest`, `GET /logs/{docID}`, `POST /query`, `GET /healthz`; `ErrBackpressure → 429 + Retry-After`, `ErrClosed → 503`, `ErrEngineFatal → 500`; unknown-field rejection on JSON input; RFC3339-with-nanos timestamp output.
+- **HTTP server** ([`internal/server`](internal/server/)) — `POST /api/ingest`, `GET /api/logs/{docID}`, `POST /api/query`, `GET /api/healthz` (legacy unprefixed paths still work); `ErrBackpressure → 429 + Retry-After`, `ErrClosed → 503`, `ErrEngineFatal → 500`; unknown-field rejection on JSON input; RFC3339-with-nanos timestamp output.
+- **Embedded web console** ([`internal/server/web`](internal/server/web/)) — vanilla HTML/JS/CSS served at `/`, packaged into the binary via `go:embed`. Three panels: live engine status (auto-refreshing every 2s), an Ingest form, and a Query panel with sample SQL. No build step, no framework, no JS bundler — the whole console is ~400 lines and ships inside `./bin/distlog`.
 - **Engine scan API** ([`internal/engine`](internal/engine/) `Scan`) — k-way merge over active MemTable + frozen MemTables + SSTables via `container/heap`, ascending DocID with source-priority tie-break for duplicates that briefly exist during flush. Powers the query executor.
 - **SQL parser** ([`internal/query`](internal/query/)) — `participle`-based grammar for `SELECT [cols|*] FROM logs [WHERE expr] [LIMIT N]`. WHERE expression supports `=` / `!=`, `AND` / `OR`, parentheses, and these fields: `ts`, `doc_id`, `tenant_id`, `source`, `message`, `fields.<key>`. Timestamp literals are RFC3339; comparison normalizes to unix-nanos.
 - **Query executor** ([`internal/query`](internal/query/)) — scan + filter + project + LIMIT. Aborts the underlying engine scan once LIMIT is reached (internal sentinel error, translated back to a clean return).
@@ -59,11 +60,11 @@ mkdir -p ./data
 # distlog: listening on :8080, data dir ./data
 ```
 
-In another terminal:
+Open <http://localhost:8080> in a browser to use the embedded console — ingest, query, and engine status panels in one page. Or use `curl` directly:
 
 ```bash
 # Ingest a log line.
-curl -s -X POST http://localhost:8080/ingest \
+curl -s -X POST http://localhost:8080/api/ingest \
   -H 'Content-Type: application/json' \
   -d '{
     "ts": "2026-05-26T12:00:00Z",
@@ -75,15 +76,15 @@ curl -s -X POST http://localhost:8080/ingest \
 # {"doc_id":1}
 
 # Fetch it back.
-curl -s http://localhost:8080/logs/1
+curl -s http://localhost:8080/api/logs/1
 # {"doc_id":1,"ts":"2026-05-26T12:00:00Z","tenant_id":"t1",...}
 
 # Engine stats.
-curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/api/healthz
 # {"status":"ok","active_memtable_size":109,"frozen_memtable_count":0,...}
 
 # Run a SQL query.
-curl -s -X POST http://localhost:8080/query \
+curl -s -X POST http://localhost:8080/api/query \
   -H 'Content-Type: application/json' \
   -d '{"sql": "SELECT message, source FROM logs WHERE fields.level = '\''error'\'' LIMIT 10"}'
 # {"columns":["message","source"],"rows":[{"doc_id":1,"values":{"message":"connection timeout to upstream","source":"api-1"}}]}
@@ -93,12 +94,15 @@ Stop with Ctrl-C; the server drains in-flight requests and closes the engine cle
 
 ### HTTP contract
 
+The canonical paths are under `/api/`. The same handlers are also registered at the legacy unprefixed paths (`/ingest`, `/logs/{docID}`, `/query`, `/healthz`) for backwards compatibility — existing scripts keep working.
+
 | Endpoint                | Notes                                                                                          |
 |-------------------------|------------------------------------------------------------------------------------------------|
-| `POST /ingest`          | Body: single `LogRecord` JSON. `ts` accepts RFC3339 string or unix-nanos integer; omitted → now. Returns `{"doc_id": N}`. Unknown fields rejected. |
-| `GET /logs/{docID}`     | Returns the record JSON, or 404. `ts` always emitted as RFC3339 with nanos in UTC.            |
-| `POST /query`           | Body: `{"sql": "..."}`. Returns `{"columns": [...], "rows": [{"doc_id": N, "values": {...}}]}`. SQL parse errors and bad field/literal references → 400. |
-| `GET /healthz`          | Returns engine stats; `200` if healthy, `503` if engine is in fatal or closed state.          |
+| `POST /api/ingest`      | Body: single `LogRecord` JSON. `ts` accepts RFC3339 string or unix-nanos integer; omitted → now. Returns `{"doc_id": N}`. Unknown fields rejected. |
+| `GET /api/logs/{docID}` | Returns the record JSON, or 404. `ts` always emitted as RFC3339 with nanos in UTC.            |
+| `POST /api/query`       | Body: `{"sql": "..."}`. Returns `{"columns": [...], "rows": [{"doc_id": N, "values": {...}}]}`. SQL parse errors and bad field/literal references → 400. |
+| `GET /api/healthz`      | Returns engine stats; `200` if healthy, `503` if engine is in fatal or closed state.          |
+| `GET /`                 | Embedded HTML/JS console (live status + ingest form + query runner).                          |
 
 **SQL dialect** (full-scan executor; no optimizer):
 
@@ -134,7 +138,8 @@ distlog/
 ├── cmd/distlog/        # server binary (loads config, opens engine, serves HTTP)
 ├── internal/
 │   ├── config/         # YAML config loader (DONE)
-│   ├── server/         # HTTP handlers (DONE)
+│   ├── server/         # HTTP handlers + embedded console (DONE)
+│   │   └── web/        # vanilla HTML/JS/CSS console (go:embed'd into binary)
 │   ├── engine/         # WAL + MemTable + SSTable orchestration (DONE through Stage E)
 │   ├── wal/            # write-ahead log + Manager (DONE)
 │   ├── memtable/       # in-memory sorted store with freeze (DONE)
@@ -207,6 +212,7 @@ Each stage is a coherent commit-set, not a calendar week.
 - [x] **Stage F** — config loader + HTTP server + working `cmd/distlog` binary
 - [x] **Stage G** — `engine.Scan` k-way merge + minimal SQL parser/executor + `POST /query`
 - [x] **Stage H** — `ts` predicate pushdown (planner extracts AND-chain bounds; engine prunes SSTables by meta-block min/max timestamp) + benchmark suite
+- [x] **Stage I** — `/api/*` route reorganization + embedded vanilla-JS console at `/` (status / ingest / query) via `go:embed`
 - [ ] **Next** — likely inverted index for `MATCH`, or `ORDER BY ts DESC LIMIT N` with TopK min-heap
 
 ## Contributing

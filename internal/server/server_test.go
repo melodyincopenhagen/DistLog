@@ -189,6 +189,85 @@ func TestGet_DocIDZeroRejected(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+func TestQuery_EndToEnd(t *testing.T) {
+	h := newHarness(t, openEngine(t), Config{})
+	defer h.close(t)
+
+	// Ingest a handful of records.
+	for _, p := range []struct {
+		src, msg, level string
+	}{
+		{"api", "hello", "info"},
+		{"api", "boom", "error"},
+		{"db", "slow query", "warn"},
+		{"api", "another error", "error"},
+	} {
+		body, _ := json.Marshal(map[string]any{
+			"source":  p.src,
+			"message": p.msg,
+			"fields":  map[string]string{"level": p.level},
+		})
+		resp, err := http.Post(h.baseURL+"/ingest", "application/json", bytes.NewReader(body))
+		require.NoError(t, err)
+		resp.Body.Close()
+	}
+
+	// SELECT errors only.
+	queryBody, _ := json.Marshal(map[string]string{
+		"sql": "SELECT message, source FROM logs WHERE fields.level = 'error'",
+	})
+	resp, err := http.Post(h.baseURL+"/query", "application/json", bytes.NewReader(queryBody))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var result struct {
+		Columns []string `json:"columns"`
+		Rows    []struct {
+			DocID  uint64                 `json:"doc_id"`
+			Values map[string]interface{} `json:"values"`
+		} `json:"rows"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	require.Equal(t, []string{"message", "source"}, result.Columns)
+	require.Len(t, result.Rows, 2)
+	require.Equal(t, "boom", result.Rows[0].Values["message"])
+	require.Equal(t, "another error", result.Rows[1].Values["message"])
+}
+
+func TestQuery_BadSQLReturns400(t *testing.T) {
+	h := newHarness(t, openEngine(t), Config{})
+	defer h.close(t)
+
+	body, _ := json.Marshal(map[string]string{"sql": "DROP TABLE logs"})
+	resp, err := http.Post(h.baseURL+"/query", "application/json", bytes.NewReader(body))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestQuery_LimitTruncates(t *testing.T) {
+	h := newHarness(t, openEngine(t), Config{})
+	defer h.close(t)
+
+	for i := 0; i < 10; i++ {
+		body, _ := json.Marshal(map[string]string{"message": "x"})
+		resp, err := http.Post(h.baseURL+"/ingest", "application/json", bytes.NewReader(body))
+		require.NoError(t, err)
+		resp.Body.Close()
+	}
+
+	body, _ := json.Marshal(map[string]string{"sql": "SELECT message FROM logs LIMIT 3"})
+	resp, err := http.Post(h.baseURL+"/query", "application/json", bytes.NewReader(body))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var result struct {
+		Rows []any `json:"rows"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+	require.Len(t, result.Rows, 3)
+}
+
 func TestHealthz_HealthyEngine(t *testing.T) {
 	h := newHarness(t, openEngine(t), Config{})
 	defer h.close(t)

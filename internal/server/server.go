@@ -1,10 +1,11 @@
 // Package server is the HTTP boundary in front of the storage engine.
 //
-// Three endpoints:
+// Four endpoints:
 //
 //	POST /ingest          single LogRecord JSON -> {"doc_id": N}
 //	GET  /logs/{docID}    -> LogRecord JSON, or 404
-//	GET  /healthz         -> engine.Stats() JSON
+//	POST /query           {"sql": "..."} -> {"columns": [...], "rows": [...]}
+//	GET  /healthz         -> engine stats JSON
 //
 // Error mapping (chosen to be HTTP-standard so generic client retry
 // logic does the right thing):
@@ -14,6 +15,8 @@
 //	engine.ErrEngineFatal  -> 500 Internal Server Error
 //	JSON decode errors     -> 400 Bad Request
 //	docID parse errors     -> 400 Bad Request
+//	SQL parse errors       -> 400 Bad Request
+//	SQL eval errors        -> 400 Bad Request (caller's query is wrong)
 //	Get not-found          -> 404 Not Found
 //	any other engine error -> 500 Internal Server Error
 package server
@@ -30,6 +33,7 @@ import (
 	"time"
 
 	"github.com/yuexishen/distlog/internal/engine"
+	"github.com/yuexishen/distlog/internal/query"
 	"github.com/yuexishen/distlog/internal/types"
 )
 
@@ -74,6 +78,7 @@ func New(cfg Config, eng *engine.Engine) *Server {
 func (s *Server) routes() {
 	s.mux.HandleFunc("POST /ingest", s.handleIngest)
 	s.mux.HandleFunc("GET /logs/{docID}", s.handleGet)
+	s.mux.HandleFunc("POST /query", s.handleQuery)
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 }
 
@@ -226,6 +231,42 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		Fields:    rec.Fields,
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// queryRequest is the on-wire shape for POST /query.
+type queryRequest struct {
+	SQL string `json:"sql"`
+}
+
+func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	var req queryRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid request body: %v", err))
+		return
+	}
+	stmt, err := query.Parse(req.SQL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Query execution doesn't use WriteRequestTimeout — that knob is
+	// for the write path's backpressure stall. Use the request ctx
+	// directly; clients that want fail-fast set their own client-side
+	// timeout.
+	res, err := query.Execute(r.Context(), s.engine, stmt)
+	if err != nil {
+		// Evaluator errors (unknown field, bad ts literal) are caller
+		// errors -> 400. ErrClosed surfaces through Scan.
+		if errors.Is(err, engine.ErrClosed) {
+			writeEngineError(w, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // healthResponse is the on-wire shape for /healthz. Kept separate

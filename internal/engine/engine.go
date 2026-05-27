@@ -27,6 +27,7 @@
 package engine
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yuexishen/distlog/internal/iter"
 	"github.com/yuexishen/distlog/internal/memtable"
 	"github.com/yuexishen/distlog/internal/sstable"
 	"github.com/yuexishen/distlog/internal/types"
@@ -593,6 +595,150 @@ func (e *Engine) Get(docID types.DocID) (*types.LogRecord, bool, error) {
 		}
 	}
 	return nil, false, nil
+}
+
+// Scan visits every distinct DocID currently in the engine, in ascending
+// DocID order. When the same DocID exists in multiple sources (active,
+// frozen, SSTable) — which can briefly happen while a flush is in
+// flight — the highest-priority version wins, where priority is
+//
+//	active > frozen (newest -> oldest) > sstable (newest -> oldest)
+//
+// matching the precedence used by Get.
+//
+// visit is invoked with each (DocID, *LogRecord) pair. Returning a non-
+// nil error aborts the scan and returns that error from Scan; ctx
+// cancellation is checked between records and surfaces ctx.Err().
+//
+// Scan is intended for query execution. It is NOT safe to call Engine.Close
+// while a Scan is in flight — the caller is responsible for sequencing.
+// (Sound reference-counted snapshots are deferred until they become
+// load-bearing.)
+func (e *Engine) Scan(ctx context.Context, visit func(types.DocID, *types.LogRecord) error) error {
+	if e.closed.Load() {
+		return ErrClosed
+	}
+
+	// Snapshot source references under the read lock. Iteration itself
+	// runs without the lock; the data sources remain valid because we
+	// hold references.
+	e.mu.RLock()
+	active := e.active
+	frozen := append([]memtable.MemTable(nil), e.frozen...)
+	sstables := append([]*sstable.Reader(nil), e.sstables...)
+	e.mu.RUnlock()
+
+	// Build cursors in priority order: lower priority value = higher
+	// precedence (wins ties on duplicate DocID).
+	var cursors []*scanCursor
+	addCursor := func(it iter.Iterator, prio int) {
+		c := &scanCursor{it: it, prio: prio}
+		if !c.advance() {
+			_ = c.it.Close()
+			return
+		}
+		cursors = append(cursors, c)
+	}
+	prio := 0
+	if active != nil {
+		addCursor(active.Iterator(), prio)
+		prio++
+	}
+	for i := len(frozen) - 1; i >= 0; i-- {
+		addCursor(frozen[i].Iterator(), prio)
+		prio++
+	}
+	for _, sst := range sstables {
+		addCursor(sst.Iterator(), prio)
+		prio++
+	}
+	defer func() {
+		for _, c := range cursors {
+			_ = c.it.Close()
+		}
+	}()
+
+	h := scanHeap(cursors)
+	heap.Init(&h)
+
+	for h.Len() > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		top := h[0]
+		docID := top.docID
+		rec := top.rec
+		// Advance the top cursor and any other cursor whose current
+		// docID equals top.docID (those are lower-priority duplicates).
+		if top.advance() {
+			heap.Fix(&h, 0)
+		} else {
+			_ = top.it.Close()
+			heap.Pop(&h)
+		}
+		for h.Len() > 0 && h[0].docID == docID {
+			dup := h[0]
+			if dup.advance() {
+				heap.Fix(&h, 0)
+			} else {
+				_ = dup.it.Close()
+				heap.Pop(&h)
+			}
+		}
+		if err := visit(docID, rec); err != nil {
+			return err
+		}
+	}
+	// Surface any iterator-side errors that the cursors hit at end of
+	// stream. (advance returning false swallows them otherwise.)
+	for _, c := range cursors {
+		if err := c.lastErr; err != nil {
+			return fmt.Errorf("engine: scan iterator: %w", err)
+		}
+	}
+	return nil
+}
+
+// scanCursor wraps one source iterator with its current head record and
+// a tie-break priority. Lower prio wins on duplicate DocIDs.
+type scanCursor struct {
+	it      iter.Iterator
+	prio    int
+	docID   types.DocID
+	rec     *types.LogRecord
+	lastErr error
+}
+
+// advance moves to the next record. Returns false at end of stream or on
+// iterator error; the caller should Close the iterator in either case.
+func (c *scanCursor) advance() bool {
+	if !c.it.Next() {
+		c.lastErr = c.it.Err()
+		return false
+	}
+	c.docID = c.it.DocID()
+	c.rec = c.it.Record()
+	return true
+}
+
+// scanHeap is a min-heap of scanCursor by (docID, prio).
+type scanHeap []*scanCursor
+
+func (h scanHeap) Len() int { return len(h) }
+func (h scanHeap) Less(i, j int) bool {
+	if h[i].docID != h[j].docID {
+		return h[i].docID < h[j].docID
+	}
+	return h[i].prio < h[j].prio
+}
+func (h scanHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *scanHeap) Push(x any)         { *h = append(*h, x.(*scanCursor)) }
+func (h *scanHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 // Close shuts down the engine and releases resources. Idempotent. After

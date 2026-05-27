@@ -1,11 +1,16 @@
 // Package server is the HTTP boundary in front of the storage engine.
 //
-// Four endpoints:
+// Endpoints:
 //
-//	POST /ingest          single LogRecord JSON -> {"doc_id": N}
-//	GET  /logs/{docID}    -> LogRecord JSON, or 404
-//	POST /query           {"sql": "..."} -> {"columns": [...], "rows": [...]}
-//	GET  /healthz         -> engine stats JSON
+//	POST /api/ingest        single LogRecord JSON -> {"doc_id": N}
+//	GET  /api/logs/{docID}  -> LogRecord JSON, or 404
+//	POST /api/query         {"sql": "..."} -> {"columns": [...], "rows": [...]}
+//	GET  /api/healthz       -> engine stats JSON
+//	GET  /                  embedded HTML/JS console for the above
+//
+// The legacy paths POST /ingest, GET /logs/{docID}, POST /query, and
+// GET /healthz remain registered as backwards-compatible aliases —
+// existing curl examples, scripts, and clients continue to work.
 //
 // Error mapping (chosen to be HTTP-standard so generic client retry
 // logic does the right thing):
@@ -76,10 +81,23 @@ func New(cfg Config, eng *engine.Engine) *Server {
 }
 
 func (s *Server) routes() {
+	// Canonical /api/* routes. Console fetches these.
+	s.mux.HandleFunc("POST /api/ingest", s.handleIngest)
+	s.mux.HandleFunc("GET /api/logs/{docID}", s.handleGet)
+	s.mux.HandleFunc("POST /api/query", s.handleQuery)
+	s.mux.HandleFunc("GET /api/healthz", s.handleHealth)
+
+	// Legacy unprefixed aliases. Kept indefinitely — README curl
+	// examples and any existing clients depend on them. The handlers
+	// are identical references, so semantics cannot drift.
 	s.mux.HandleFunc("POST /ingest", s.handleIngest)
 	s.mux.HandleFunc("GET /logs/{docID}", s.handleGet)
 	s.mux.HandleFunc("POST /query", s.handleQuery)
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+
+	// Static console served from embedded files. The console is a
+	// single-page vanilla-JS app; no build step.
+	s.mux.Handle("GET /", http.FileServer(http.FS(consoleFS)))
 }
 
 // Serve binds and serves until ctx is canceled or ListenAndServe

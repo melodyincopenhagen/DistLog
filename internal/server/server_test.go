@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -266,6 +267,54 @@ func TestQuery_LimitTruncates(t *testing.T) {
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 	require.Len(t, result.Rows, 3)
+}
+
+func TestConsole_RootServesHTML(t *testing.T) {
+	h := newHarness(t, openEngine(t), Config{})
+	defer h.close(t)
+
+	resp, err := http.Get(h.baseURL + "/")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	ct := resp.Header.Get("Content-Type")
+	require.Contains(t, ct, "html")
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(body), "DistLog console")
+}
+
+func TestConsole_ServesCSSAndJS(t *testing.T) {
+	h := newHarness(t, openEngine(t), Config{})
+	defer h.close(t)
+
+	for _, path := range []string{"/console.css", "/console.js"} {
+		resp, err := http.Get(h.baseURL + path)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode, "path %s should serve", path)
+	}
+}
+
+func TestAPI_AliasesAndLegacyPathsBothWork(t *testing.T) {
+	// Both /api/ingest and the legacy /ingest must accept writes.
+	// Both /api/healthz and /healthz must return the same JSON shape.
+	h := newHarness(t, openEngine(t), Config{})
+	defer h.close(t)
+
+	for _, path := range []string{"/ingest", "/api/ingest"} {
+		body := strings.NewReader(`{"message":"alias-test"}`)
+		resp, err := http.Post(h.baseURL+path, "application/json", body)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode, "POST %s", path)
+	}
+	for _, path := range []string{"/healthz", "/api/healthz"} {
+		resp, err := http.Get(h.baseURL + path)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode, "GET %s", path)
+	}
 }
 
 func TestHealthz_HealthyEngine(t *testing.T) {

@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DistLog console</title>
+  <link rel="stylesheet" href="/console.css">
+</head>
+<body>
+  <header>
+    <h1>DistLog console</h1>
+    <p class="sub">Single-node storage engine + scan SQL. Backed by <code>/api/*</code> endpoints.</p>
+  </header>
+
+  <section id="health-panel">
+    <h2>Engine status <span id="health-status" class="badge">…</span></h2>
+    <table id="health-table">
+      <tbody>
+        <tr><th>SSTables</th><td id="h-sstable_count">—</td></tr>
+        <tr><th>Frozen MemTables</th><td id="h-frozen_memtable_count">—</td></tr>
+        <tr><th>Active MemTable</th><td id="h-active_memtable_size">—</td></tr>
+        <tr><th>Next DocID</th><td id="h-next_doc_id">—</td></tr>
+        <tr><th>Last scan pruned SSTables</th><td id="h-last_scan_pruned_sstables">—</td></tr>
+        <tr><th>Corrupted quarantined</th><td id="h-corrupted_sstables_quarantined">—</td></tr>
+        <tr><th>Fatal</th><td id="h-fatal">—</td></tr>
+      </tbody>
+    </table>
+    <p class="hint">Auto-refreshes every 2 seconds.</p>
+  </section>
+
+  <section id="ingest-panel">
+    <h2>Ingest</h2>
+    <p class="hint">POSTs to <code>/api/ingest</code>. <code>ts</code> is optional — server defaults to now.</p>
+    <form id="ingest-form">
+      <label>ts <input name="ts" placeholder="2026-05-26T12:00:00Z (optional)"></label>
+      <label>tenant_id <input name="tenant_id" placeholder="t1"></label>
+      <label>source <input name="source" placeholder="api-1"></label>
+      <label>message <textarea name="message" rows="2" placeholder="request handled"></textarea></label>
+      <label>fields (one key=value per line)
+        <textarea name="fields" rows="2" placeholder="level=info&#10;trace_id=abc123"></textarea>
+      </label>
+      <button type="submit">Ingest</button>
+    </form>
+    <pre id="ingest-result" class="result"></pre>
+  </section>
+
+  <section id="query-panel">
+    <h2>Query</h2>
+    <p class="hint">POSTs to <code>/api/query</code>. Try a sample:</p>
+    <div class="samples">
+      <button class="sample" data-sql="SELECT * FROM logs LIMIT 20">recent 20</button>
+      <button class="sample" data-sql="SELECT message, source FROM logs WHERE fields.level = 'error' LIMIT 50">errors</button>
+      <button class="sample" data-sql="SELECT message FROM logs WHERE ts >= '2026-01-01T00:00:00Z' AND ts <= '2026-12-31T23:59:59Z' LIMIT 50">in 2026</button>
+    </div>
+    <form id="query-form">
+      <textarea name="sql" rows="4" required>SELECT * FROM logs LIMIT 20</textarea>
+      <button type="submit">Run</button>
+    </form>
+    <p id="query-status" class="hint"></p>
+    <div id="query-result"></div>
+  </section>
+
+  <script src="/console.js" defer></script>
+</body>
+</html>

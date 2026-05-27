@@ -161,24 +161,16 @@ func TestWALNeverHasDuplicateDocID(t *testing.T) {
 func TestFrozenMemTableRejectsPut(t *testing.T) {
 	dir := t.TempDir()
 	e, err := Open(Config{
-		DataDir:            dir,
-		MemTableSizeLimit:  8 * 1024,
-		MaxFrozenMemTables: 64,                     // never backpressure
+		DataDir:             dir,
+		MemTableSizeLimit:   8 * 1024,
+		MemTableHardLimit:   1 << 30, // never stall — this test gates only via the frozen queue
+		MaxFrozenMemTables:  64,      // never backpressure
 		FlushRetryBaseDelay: 10 * time.Millisecond, // unused, but harmless
 	})
 	require.NoError(t, err)
 	defer e.Close()
 
-	// Pause flushing so the frozen list accumulates. We use a hook plus
-	// a channel to gate flush worker.
-	gate := make(chan struct{})
-	var gateOpened atomic.Bool
-	e.flushHook = func() {
-		if gateOpened.Load() {
-			return
-		}
-		<-gate
-	}
+	release := e.BlockFlushUntil()
 
 	ctx := context.Background()
 	for i := 0; i < 500; i++ {
@@ -202,8 +194,7 @@ func TestFrozenMemTableRejectsPut(t *testing.T) {
 	require.ErrorIs(t, err, memtable.ErrFrozen)
 
 	// Release the flush gate so Close can proceed.
-	gateOpened.Store(true)
-	close(gate)
+	release()
 }
 
 // === Red-line: fatal state ===
@@ -386,19 +377,13 @@ func TestBackpressure_FreezeWaitsForFlush(t *testing.T) {
 	e, err := Open(Config{
 		DataDir:            dir,
 		MemTableSizeLimit:  4 * 1024,
+		MemTableHardLimit:  1 << 30, // effectively no Write stall — this test asserts only the frozen-cap invariant
 		MaxFrozenMemTables: 2,
 	})
 	require.NoError(t, err)
 	defer e.Close()
 
-	gate := make(chan struct{})
-	var gateOpened atomic.Bool
-	e.flushHook = func() {
-		if gateOpened.Load() {
-			return
-		}
-		<-gate
-	}
+	release := e.BlockFlushUntil()
 
 	ctx := context.Background()
 	for i := 0; i < 800; i++ {
@@ -423,8 +408,7 @@ func TestBackpressure_FreezeWaitsForFlush(t *testing.T) {
 	}
 
 	// Open the gate; frozen list should drain.
-	gateOpened.Store(true)
-	close(gate)
+	release()
 	waitFor(t, func() bool {
 		e.mu.RLock()
 		defer e.mu.RUnlock()

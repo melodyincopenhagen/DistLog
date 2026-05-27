@@ -328,8 +328,8 @@ close.
 
 ## ADR-009: Backpressure Semantics Under Sustained Flush Stall
 
-- **Status**: Proposed (resolution deferred to Stage E)
-- **Date**: 2026-04-28
+- **Status**: Accepted
+- **Date**: 2026-04-28 (proposed); 2026-04-28 (accepted, Stage E)
 - **Applies to**: `internal/engine` Write path and freeze coordinator.
 
 ### Context
@@ -382,30 +382,77 @@ Write; the operator is responsible for monitoring
 control upstream. Simple and Kafka-broker-shaped, but pushes a hard
 correctness problem onto every caller.
 
-### Recommendation
+### Decision
 
-Lean toward Option A in the "ctx-driven block-or-error" form. It
-gives callers control over their own latency tolerance without
-sacrificing the engine's ability to protect itself.
+Adopt Option A in the "ctx-driven block-or-error" form. Concrete
+parameters:
 
-### Open implementation questions for Stage E
+- New config field `MemTableHardLimit`, defaulting to
+  `2 × MemTableSizeLimit`. Decoupled from `MaxFrozenMemTables` so
+  the two knobs stay orthogonal: tuning the frozen queue (a
+  burst-absorption knob) does not also amplify active-MemTable
+  headroom.
+- `MemTableHardLimit` is documented as "hard upper bound under
+  stall," not "steady-state target." Under healthy operation the
+  active MemTable stays well below it; the hard limit only matters
+  when freeze cannot rotate.
+- Stall primitive is `sync.Cond` on a dedicated `stallMu`. The
+  flush worker `Broadcast`s after Phase 6 (frozen queue shrinks).
+  The freeze coordinator `Broadcast`s after rotating active to
+  fresh.
+- Per-Write watchdog goroutine, started only on the slow path,
+  bridges `ctx` to `sync.Cond`. Healthy Writes do not pay this
+  cost — the fast path is a single read-lock predicate check.
+- Watchdog lifecycle is explicit: a `stop` channel and a
+  `watchdogDone` channel pair guarantee the goroutine exits before
+  Write returns, regardless of which side wins the race (natural
+  wake vs. ctx expiry).
+- Error type: `errors.Join(ErrBackpressure, ctx.Err())`. Both
+  `errors.Is(err, ErrBackpressure)` and
+  `errors.Is(err, context.DeadlineExceeded)` (or `context.Canceled`)
+  match, letting callers distinguish "deadline elapsed, retry later"
+  from "caller cancelled, do not retry."
 
-- How does the test inject a "permanently stalled flush" without
-  using `flushHook`? `flushHook` is currently a private field;
-  Stage E may need a more principled wait primitive.
-- Should `MemTableHardLimit` default to a fixed multiple of
-  `MemTableSizeLimit` (e.g. 2×) rather than scaling with
-  `MaxFrozenMemTables`?
-- Existing `TestBackpressure_FreezeWaitsForFlush` should be
-  extended (or duplicated) to assert active-MemTable bounded
-  growth under stall.
+### Why not Option B
 
-### Related Stage E task
+Option B (engine never blocks; caller monitors stats and applies
+flow control upstream) was rejected because the LSM engine's Write
+callers — replication FSM, ingestion pipelines, log shippers —
+typically do not know and should not need to know the state of the
+frozen MemTable queue. Pushing that responsibility onto every caller
+makes correctness an N-place problem instead of a 1-place one, and
+historically these "monitor and back off" contracts decay: callers
+forget the contract, miss the metric, or sample too slowly. Option A
+keeps the correctness boundary inside the engine; the only thing
+callers must understand is `ctx` and a sentinel error, both of which
+they already handle for every other engine call.
 
-`Write` path under WAL append failure currently propagates the error
-but is not tested for "engine is still healthy after the failure;
-the next Write does not panic and does not corrupt MemTable state".
-Pure test work, no design implications, but should land in the same
-Stage E commit as the backpressure fix.
+The Kafka-broker analogy in the original Option B framing does not
+hold cleanly: Kafka brokers expose the queue state via a wire
+protocol with explicit producer-side throttling primitives, not via
+"check stats and self-throttle." DistLog has no such protocol, and
+adding one purely to support non-blocking Writes is more work than
+the cond-based block.
+
+### Implementation notes from Stage E
+
+- `flushHook` was kept as a low-level fault-injection seam; a
+  higher-level `BlockFlushUntil() (release func())` test helper
+  was added in `internal/engine/export_test.go` for stall tests.
+  Following stdlib precedent, no `//go:build test` tag is used:
+  `_test.go` files are only compiled under `go test` and can
+  expose package-private symbols to same-package tests.
+- The pre-Stage-E test `TestBackpressure_FreezeWaitsForFlush`
+  was preserved (with `MemTableHardLimit: 1<<30` so it asserts
+  only the frozen-queue invariant), and a new
+  `TestBackpressure_ActiveMemTableBoundedUnderStall` asserts
+  the active-MemTable growth bound that ADR-009 was filed for.
+- Companion test
+  `TestEngine_WALAppendFailure_EngineRemainsHealthy` covers the
+  ADR-009-tail concern: WAL append failure surfaces as a per-call
+  error, the engine stays out of fatal state, and reads of
+  pre-failure data continue to work. The MemTable-subset-of-WAL
+  invariant is preserved because the Write path returns before
+  touching MemTable on WAL failure.
 
 ---

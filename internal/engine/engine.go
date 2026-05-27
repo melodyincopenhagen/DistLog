@@ -49,6 +49,26 @@ var (
 	ErrClosed              = errors.New("engine: closed")
 	ErrEngineFatal         = errors.New("engine: fatal state")
 	ErrTooManyWriteRetries = errors.New("engine: too many write retries")
+
+	// ErrBackpressure is returned by Write when sustained flush stall
+	// has filled both the frozen MemTable queue and the active MemTable
+	// up to MemTableHardLimit, and the caller's context expired before a
+	// slot opened.
+	//
+	// ErrBackpressure is transient: the engine remains healthy after
+	// returning it, both reads and writes continue to be served, and
+	// future Write calls may succeed once flush drains a frozen slot.
+	// This is the contrast point with ErrEngineFatal, which is terminal.
+	//
+	// The returned error wraps both ErrBackpressure and the underlying
+	// ctx.Err() via errors.Join, so both
+	//
+	//	errors.Is(err, ErrBackpressure)
+	//	errors.Is(err, context.DeadlineExceeded)  // or context.Canceled
+	//
+	// match. Callers that distinguish "deadline elapsed (retry later)"
+	// from "caller cancelled (do not retry)" can use the second form.
+	ErrBackpressure = errors.New("engine: write stalled due to backpressure")
 )
 
 // OnFatalFunc is invoked when the engine enters an unrecoverable state.
@@ -82,6 +102,29 @@ type Config struct {
 	// MemTableSizeLimit is the soft byte threshold that triggers freezing
 	// the active MemTable. Default: 4 MiB.
 	MemTableSizeLimit int64
+
+	// MemTableHardLimit is the hard upper bound on the active MemTable's
+	// size during a flush stall. It is *not* a steady-state target — under
+	// normal operation freeze rotation keeps the active MemTable below
+	// MemTableSizeLimit. Only when freeze cannot rotate (because the
+	// frozen queue is full waiting on flush) does the active MemTable
+	// grow past MemTableSizeLimit, and MemTableHardLimit is the size at
+	// which Write enters its stall path and blocks until ctx expiry or
+	// until flush drains a slot.
+	//
+	// Two knobs, two roles, intentionally orthogonal:
+	//
+	//   MemTableSizeLimit   freeze trigger
+	//   MemTableHardLimit   Write-stall trigger
+	//
+	// The gap between them is the tolerance window for "freeze gate has
+	// been told to open but hasn't actually rotated yet."
+	//
+	// Default: 2 × MemTableSizeLimit. Decoupling this from
+	// MaxFrozenMemTables means tuning the frozen queue (a burst-absorption
+	// knob) does not also amplify active-MemTable headroom; the two
+	// knobs stay independent.
+	MemTableHardLimit int64
 
 	// MaxFrozenMemTables caps how many frozen MemTables may sit waiting
 	// for flush before write-side backpressure kicks in (the freeze
@@ -123,6 +166,9 @@ const (
 func (c *Config) applyDefaults() {
 	if c.MemTableSizeLimit == 0 {
 		c.MemTableSizeLimit = defaultMemTableSizeLimit
+	}
+	if c.MemTableHardLimit == 0 {
+		c.MemTableHardLimit = 2 * c.MemTableSizeLimit
 	}
 	if c.MaxFrozenMemTables == 0 {
 		c.MaxFrozenMemTables = defaultMaxFrozenMemTables
@@ -180,7 +226,14 @@ type Engine struct {
 	flushCh      chan struct{}
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
-	workersWG   sync.WaitGroup
+	workersWG    sync.WaitGroup
+
+	// Stall condvar. Writers waiting for backpressure to clear sleep
+	// here; the flush worker Broadcasts after Phase 6 (frozen queue
+	// shrinks). stallMu guards the cond only — predicate evaluation
+	// still queries e.mu-protected state.
+	stallMu   sync.Mutex
+	stallCond *sync.Cond
 
 	// State flags.
 	closed atomic.Bool
@@ -429,6 +482,7 @@ func Open(cfg Config) (*Engine, error) {
 		shutdownCh:         make(chan struct{}),
 		lastRecoveryReport: report,
 	}
+	e.stallCond = sync.NewCond(&e.stallMu)
 	e.nextSSTSeq.Store(maxSSTableID)
 
 	e.workersWG.Add(2)
@@ -441,13 +495,31 @@ func Open(cfg Config) (*Engine, error) {
 // MemTable. Returns the DocID assigned to the record.
 //
 // Returns ErrClosed if the Engine is closed, ErrEngineFatal if the engine
-// is in fatal state, or a wrapped I/O error if WAL append fails.
+// is in fatal state, ErrBackpressure (joined with ctx.Err()) if a
+// sustained flush stall has filled the active MemTable past
+// MemTableHardLimit and ctx expires before flush drains a slot, or a
+// wrapped I/O error if WAL append fails.
+//
+// Backpressure semantics: under healthy operation, Write does not block
+// beyond WAL append latency. If freeze cannot keep up with write rate
+// (frozen queue full and flush stalled), Write blocks once the active
+// MemTable reaches MemTableHardLimit. Blocking is bounded by ctx —
+// callers that prefer fail-fast semantics pass a short context; callers
+// that prefer to wait pass a long one. ErrBackpressure is transient:
+// the engine remains healthy, reads continue to be served, and the next
+// Write call may succeed once flush makes progress.
 func (e *Engine) Write(ctx context.Context, record *types.LogRecord) (types.DocID, error) {
 	if e.closed.Load() {
 		return 0, ErrClosed
 	}
 	if e.fatal.Load() {
 		return 0, ErrEngineFatal
+	}
+
+	// Stall gate — block before allocating a docID so that timeout does
+	// not consume a docID and leave a hole in the allocator sequence.
+	if err := e.waitForStallClear(ctx); err != nil {
+		return 0, err
 	}
 
 	docID := e.alloc.Next()
@@ -557,9 +629,14 @@ func (e *Engine) Close() error {
 
 // signalShutdown closes shutdownCh exactly once, regardless of whether
 // it was triggered by Close or by fatal state. Both call this; ordering
-// between them is not defined, both are safe.
+// between them is not defined, both are safe. After closing, any writers
+// stalled on the backpressure cond are broadcast-woken so they can
+// observe shutdown / fatal / closed and unwind cleanly.
 func (e *Engine) signalShutdown() {
-	e.shutdownOnce.Do(func() { close(e.shutdownCh) })
+	e.shutdownOnce.Do(func() {
+		close(e.shutdownCh)
+		e.notifyStallCleared()
+	})
 }
 
 // onFatalError transitions the engine into fatal state. Idempotent: only
@@ -602,6 +679,121 @@ func (e *Engine) Stats() Stats {
 		Fatal:                        e.fatal.Load(),
 		Closed:                       e.closed.Load(),
 	}
+}
+
+// === Backpressure stall ===
+
+// stallPredicate reports whether Write must block. The active MemTable
+// is over the hard limit AND the frozen queue is full, so freeze cannot
+// rotate to make room. Both conditions must hold; either alone is fine.
+//
+// Caller must hold e.mu (read or write).
+func (e *Engine) stallPredicateLocked() bool {
+	if e.active == nil {
+		return false
+	}
+	return e.active.SizeBytes() >= e.cfg.MemTableHardLimit &&
+		len(e.frozen) >= e.cfg.MaxFrozenMemTables
+}
+
+// waitForStallClear blocks until backpressure has cleared, ctx expires,
+// or the engine starts shutting down. The fast path (no stall) takes
+// only a read-lock check and adds no goroutines.
+//
+// On stall, a per-Write watchdog goroutine is started to broadcast on
+// ctx expiry — sync.Cond does not natively integrate with ctx. The
+// watchdog is started only on the slow path; healthy Writes do not pay
+// for it.
+//
+// The watchdog Broadcasts to the whole cond, waking every stalled
+// writer. Each woken writer re-checks (a) the predicate, (b) its own
+// ctx, and (c) shutdown — standard Cond re-check loop. Spurious
+// broadcasts cause harmless re-evaluation, never silent skip-of-stall.
+//
+// On the writer's exit path the watchdog's timer is stopped and the
+// watchdog goroutine is joined via watchdogDone — no goroutine leak
+// regardless of which side wins the race.
+func (e *Engine) waitForStallClear(ctx context.Context) error {
+	// Fast path: predicate already false.
+	e.mu.RLock()
+	if !e.stallPredicateLocked() {
+		e.mu.RUnlock()
+		return nil
+	}
+	e.mu.RUnlock()
+
+	// Slow path: enter the cond loop. The watchdog goroutine ensures
+	// ctx expiry wakes us even if no flush ever drains a slot.
+	watchdogDone := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		select {
+		case <-ctx.Done():
+			e.stallCond.L.Lock()
+			e.stallCond.Broadcast()
+			e.stallCond.L.Unlock()
+		case <-e.shutdownCh:
+			e.stallCond.L.Lock()
+			e.stallCond.Broadcast()
+			e.stallCond.L.Unlock()
+		case <-stop:
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-watchdogDone
+	}()
+
+	e.stallCond.L.Lock()
+	defer e.stallCond.L.Unlock()
+	for {
+		// Re-check ctx and shutdown first; either may have caused the
+		// wake, and we should not re-enter Wait if so.
+		if err := ctx.Err(); err != nil {
+			return errors.Join(ErrBackpressure, err)
+		}
+		if e.closed.Load() {
+			return ErrClosed
+		}
+		if e.fatal.Load() {
+			return ErrEngineFatal
+		}
+
+		// Re-check the predicate. Drop the cond mutex during the
+		// e.mu read lock to avoid lock-order coupling between the
+		// two — flush takes e.mu before broadcasting, and we must
+		// not invert that order.
+		e.stallCond.L.Unlock()
+		e.mu.RLock()
+		clear := !e.stallPredicateLocked()
+		e.mu.RUnlock()
+		e.stallCond.L.Lock()
+
+		if clear {
+			return nil
+		}
+
+		// Re-check ctx after the predicate read. The watchdog may
+		// have broadcast while we were unlocked.
+		if err := ctx.Err(); err != nil {
+			return errors.Join(ErrBackpressure, err)
+		}
+
+		e.stallCond.Wait()
+	}
+}
+
+// notifyStallCleared wakes any writers stalled in waitForStallClear.
+// Safe to call unconditionally; spurious wakes are filtered by the
+// predicate re-check inside the cond loop.
+func (e *Engine) notifyStallCleared() {
+	if e.stallCond == nil {
+		return
+	}
+	e.stallCond.L.Lock()
+	e.stallCond.Broadcast()
+	e.stallCond.L.Unlock()
 }
 
 // === Freeze coordinator ===
@@ -672,6 +864,10 @@ func (e *Engine) doFreeze() {
 	case e.flushCh <- struct{}{}:
 	default:
 	}
+	// Active was just reset to an empty MemTable — even if the frozen
+	// queue is still full, the predicate's "active >= hard limit" half
+	// is now false and any stalled writer can proceed.
+	e.notifyStallCleared()
 }
 
 // === Flush worker ===
@@ -804,11 +1000,13 @@ func (e *Engine) flushOneIfAny() (done bool, err error) {
 		_ = err
 	}
 
-	// Phase 6: notify freeze in case it was waiting on backpressure.
+	// Phase 6: notify freeze in case it was waiting on backpressure,
+	// and wake stalled writers — frozen queue just shrank by one.
 	select {
 	case e.freezeCh <- struct{}{}:
 	default:
 	}
+	e.notifyStallCleared()
 
 	return true, nil
 }

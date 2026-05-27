@@ -1,0 +1,23 @@
+# Local development config for `distlog --config configs/dev.yaml`.
+# All fields shown; omitting any falls back to the default applied in
+# internal/config (server) or internal/engine (engine sub-fields).
+
+server:
+  listen_addr: ":8080"
+  shutdown_timeout: 10s
+  # Per-request ctx deadline on POST /ingest. If the engine stalls
+  # under backpressure for longer than this, the request returns
+  # 429 Too Many Requests with Retry-After: 1.
+  write_request_timeout: 5s
+
+engine:
+  data_dir: ./data
+  # Soft freeze trigger. When the active MemTable exceeds this size,
+  # it is frozen and a new active MemTable takes its place. Default
+  # 4 MiB; set lower here to make freeze/flush observable in dev.
+  memtable_size_limit: 1048576       # 1 MiB
+  # Hard Write-stall threshold. Active MemTable cannot grow past
+  # this under sustained flush stall. Default 2 x memtable_size_limit.
+  memtable_hard_limit: 2097152       # 2 MiB
+  # Max queued frozen MemTables awaiting flush.
+  max_frozen_memtables: 4

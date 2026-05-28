@@ -8,3 +8,5 @@ data/
 .vscode/
 coverage.txt
 CLAUDE.md
+__pycache__/
+*.pyc

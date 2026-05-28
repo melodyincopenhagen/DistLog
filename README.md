@@ -23,7 +23,9 @@ The single-node service is operational and tested end-to-end via HTTP. Specifica
 - **Backpressure** (ADR-009) — under sustained flush stall, `Engine.Write` blocks once the active MemTable reaches `MemTableHardLimit` (default 2× `MemTableSizeLimit`) and the frozen queue is full. Block is bounded by `ctx`; on expiry the call returns `errors.Join(ErrBackpressure, ctx.Err())`. Engine stays healthy and resumes serving once flush drains.
 - **YAML config** ([`internal/config`](internal/config/)) — single typed loader; unknown fields fail loudly; defaults live in code, not YAML. See [`configs/dev.yaml`](configs/dev.yaml).
 - **HTTP server** ([`internal/server`](internal/server/)) — `POST /api/ingest`, `GET /api/logs/{docID}`, `POST /api/query`, `GET /api/healthz` (legacy unprefixed paths still work); `ErrBackpressure → 429 + Retry-After`, `ErrClosed → 503`, `ErrEngineFatal → 500`; unknown-field rejection on JSON input; RFC3339-with-nanos timestamp output.
-- **Embedded web console** ([`internal/server/web`](internal/server/web/)) — vanilla HTML/JS/CSS served at `/`, packaged into the binary via `go:embed`. Three panels: live engine status (auto-refreshing every 2s), an Ingest form, and a Query panel with sample SQL. No build step, no framework, no JS bundler — the whole console is ~400 lines and ships inside `./bin/distlog`.
+- **Embedded web console** ([`internal/server/web`](internal/server/web/)) — vanilla HTML/JS/CSS served at `/`, packaged into the binary via `go:embed`. Three panels: live engine status with a Canvas-rendered chart of MemTable size / writes-per-sec / SSTable pruning over a rolling 2-min window; an Ingest form; a Query panel with SQL syntax highlighting (textarea-over-`<pre>` overlay), sample queries, and click-to-sort result columns. Polling rate drops 15× when the tab is hidden. Login dialog backed by `sessionStorage` shows up only when the server requires auth. No build step, no framework, no bundler — the whole console is ~700 lines and ships inside `./bin/distlog`.
+- **Token auth + per-tenant isolation** ([`internal/server`](internal/server/) + ADR-010) — `Authorization: Bearer <token>` middleware resolves a tenant identity per request; absent `auth.tokens` config the server runs auth-disabled for dev. Write silently overrides the body `tenant_id` (clients cannot forge tenancy); Query rewrites the parsed AST to `(caller WHERE) AND tenant_id = '<caller>'` (AST rewrite, not string concat — hostile tenant IDs cannot escape the literal); cross-tenant Get returns 404 not 403 to avoid existence leaks; `/api/healthz` is never gated.
+- **Python client SDK** ([`examples/python/distlog_client.py`](examples/python/distlog_client.py)) — stdlib-only (no pip install), typed exception hierarchy (`UnauthorizedError`, `ParseError`, `BackpressureError`, `ServerError`), and a backpressure-aware retry loop that honors the server's `Retry-After` header. Mirrors the Stage E engine contract from the client side. See [`examples/python/example.py`](examples/python/example.py) for end-to-end usage.
 - **Engine scan API** ([`internal/engine`](internal/engine/) `Scan`) — k-way merge over active MemTable + frozen MemTables + SSTables via `container/heap`, ascending DocID with source-priority tie-break for duplicates that briefly exist during flush. Powers the query executor.
 - **SQL parser** ([`internal/query`](internal/query/)) — `participle`-based grammar for `SELECT [cols|*] FROM logs [WHERE expr] [LIMIT N]`. WHERE expression supports `=` / `!=`, `AND` / `OR`, parentheses, and these fields: `ts`, `doc_id`, `tenant_id`, `source`, `message`, `fields.<key>`. Timestamp literals are RFC3339; comparison normalizes to unix-nanos.
 - **Query executor** ([`internal/query`](internal/query/)) — scan + filter + project + LIMIT. Aborts the underlying engine scan once LIMIT is reached (internal sentinel error, translated back to a clean return).
@@ -92,9 +94,27 @@ curl -s -X POST http://localhost:8080/api/query \
 
 Stop with Ctrl-C; the server drains in-flight requests and closes the engine cleanly.
 
+### Using from Python
+
+The repo ships a stdlib-only client (no `pip install` needed):
+
+```python
+from examples.python.distlog_client import Client
+
+c = Client("http://localhost:8080")  # add token="…" if auth enabled
+doc_id = c.write("hello", source="api", fields={"level": "info"})
+result = c.query("SELECT message FROM logs WHERE fields.level = 'info' LIMIT 10")
+for row in result.rows:
+    print(row.doc_id, row.values["message"])
+```
+
+The client raises `BackpressureError`, `UnauthorizedError`, `ParseError`, or `ServerError` for the obvious failure modes, and retries 429s honoring the server's `Retry-After` header. See [`examples/python/example.py`](examples/python/example.py) for the full end-to-end script.
+
 ### HTTP contract
 
 The canonical paths are under `/api/`. The same handlers are also registered at the legacy unprefixed paths (`/ingest`, `/logs/{docID}`, `/query`, `/healthz`) for backwards compatibility — existing scripts keep working.
+
+**Authentication.** If `auth.tokens` is present in the config, the server requires `Authorization: Bearer <token>` on `/api/ingest`, `/api/logs/{docID}`, and `/api/query` (and their legacy aliases). Tokens not in the map → 401. `/api/healthz` is never gated. Without any `auth.tokens` config the server runs auth-disabled and tags everything as `_anonymous`. See [`docs/DECISIONS.md`](docs/DECISIONS.md) ADR-010 for the model.
 
 | Endpoint                | Notes                                                                                          |
 |-------------------------|------------------------------------------------------------------------------------------------|
@@ -153,6 +173,8 @@ distlog/
 ├── api/proto/          # empty — planned (gRPC service definitions)
 ├── configs/
 │   └── dev.yaml        # example local config
+├── examples/
+│   └── python/         # stdlib-only Python client SDK + end-to-end example
 ├── test/
 │   ├── integration/    # empty — planned (`-tags=integration`)
 │   └── chaos/          # empty — planned (`-tags=chaos`)
@@ -213,6 +235,9 @@ Each stage is a coherent commit-set, not a calendar week.
 - [x] **Stage G** — `engine.Scan` k-way merge + minimal SQL parser/executor + `POST /query`
 - [x] **Stage H** — `ts` predicate pushdown (planner extracts AND-chain bounds; engine prunes SSTables by meta-block min/max timestamp) + benchmark suite
 - [x] **Stage I** — `/api/*` route reorganization + embedded vanilla-JS console at `/` (status / ingest / query) via `go:embed`
+- [x] **Stage J** — console upgrades: live Canvas chart, SQL syntax highlight, sortable result table, visibility-aware polling
+- [x] **Stage K** — token-bearer auth + per-tenant isolation (AST rewrite for query scoping, body-tenant override for ingest, 404-not-403 for cross-tenant Get) — see ADR-010
+- [x] **Stage L** — Python client SDK (stdlib-only) with typed exceptions and Retry-After-aware backpressure retry
 - [ ] **Next** — likely inverted index for `MATCH`, or `ORDER BY ts DESC LIMIT N` with TopK min-heap
 
 ## Contributing

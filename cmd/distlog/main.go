@@ -55,6 +55,8 @@ func run() error {
 		ListenAddr:          cfg.Server.ListenAddr,
 		ShutdownTimeout:     cfg.Server.ShutdownTimeout,
 		WriteRequestTimeout: cfg.Server.WriteRequestTimeout,
+		Tokens:              cfg.Auth.Tokens,
+		AnonymousTenant:     config.AnonymousTenant,
 	}, eng)
 
 	// Bind ctx to SIGINT/SIGTERM so the server shuts down cleanly.

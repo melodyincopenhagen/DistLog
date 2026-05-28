@@ -82,6 +82,29 @@ engine:
 	require.Error(t, err)
 }
 
+func TestLoad_AuthTokensParsed(t *testing.T) {
+	path := writeYAML(t, `
+engine:
+  data_dir: /tmp/x
+auth:
+  tokens:
+    "tok-abc123": "tenant-a"
+    "tok-def456": "tenant-b"
+`)
+	c, err := Load(path)
+	require.NoError(t, err)
+	require.Len(t, c.Auth.Tokens, 2)
+	require.Equal(t, "tenant-a", c.Auth.Tokens["tok-abc123"])
+	require.Equal(t, "tenant-b", c.Auth.Tokens["tok-def456"])
+}
+
+func TestLoad_AuthOmittedIsEmptyMap(t *testing.T) {
+	path := writeYAML(t, `engine: { data_dir: /tmp/x }`)
+	c, err := Load(path)
+	require.NoError(t, err)
+	require.Empty(t, c.Auth.Tokens, "no tokens configured -> auth disabled mode")
+}
+
 func TestLoad_FileNotFound(t *testing.T) {
 	_, err := Load("/nonexistent/path/config.yaml")
 	require.Error(t, err)

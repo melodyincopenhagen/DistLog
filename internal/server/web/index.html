@@ -9,7 +9,23 @@
   <header>
     <h1>DistLog console</h1>
     <p class="sub">Single-node storage engine + scan SQL. Backed by <code>/api/*</code> endpoints.</p>
+    <div id="auth-bar">
+      <span id="auth-status" class="hint">checking auth…</span>
+      <button id="auth-toggle" hidden></button>
+    </div>
   </header>
+
+  <dialog id="login-dialog">
+    <form method="dialog">
+      <h3>Sign in</h3>
+      <p class="hint">The server requires an Authorization token. Get one from the operator (look for <code>auth.tokens</code> in the server config).</p>
+      <label>Token <input id="login-token" type="password" autocomplete="off" required></label>
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:8px;">
+        <button type="button" id="login-cancel" style="background:var(--border); color:var(--text);">Cancel</button>
+        <button id="login-submit" value="ok">Sign in</button>
+      </div>
+    </form>
+  </dialog>
 
   <section id="health-panel">
     <h2>Engine status <span id="health-status" class="badge">…</span></h2>

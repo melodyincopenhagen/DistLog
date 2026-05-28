@@ -23,7 +23,38 @@ import (
 type Config struct {
 	Server ServerConfig `yaml:"server"`
 	Engine EngineConfig `yaml:"engine"`
+	Auth   AuthConfig   `yaml:"auth"`
 }
+
+// AuthConfig configures token-based tenant authentication.
+//
+// If Tokens is empty, the server runs in "auth disabled" mode: requests
+// without an Authorization header are accepted and treated as tenant
+// "_anonymous". This keeps single-user dev setups unbreakingly simple.
+//
+// If Tokens is non-empty, the server requires Authorization: Bearer
+// <token> on /api/ingest and /api/query and /api/logs/{docID}. Tokens
+// not in the map -> 401 Unauthorized. /api/healthz is never gated
+// (operational probe). The console's login page accepts a token and
+// stashes it in sessionStorage.
+//
+// Storage model on disk does not include a tenant index — multi-tenancy
+// is a query-time filter, not a partitioning concern. See
+// docs/DECISIONS.md ADR-010.
+type AuthConfig struct {
+	// Tokens maps bearer tokens to tenant IDs. The token value MUST
+	// be opaque (not the tenant_id itself) so leaking a tenant_id
+	// in logs doesn't compromise auth.
+	//
+	// Tokens here are STATIC — config reload is not supported in this
+	// stage. Rotation requires a process restart.
+	Tokens map[string]string `yaml:"tokens"`
+}
+
+// AnonymousTenant is the tenant identity assigned to requests in
+// "auth disabled" mode (no tokens configured) and used as the default
+// tenant on Write when no body tenant_id is supplied.
+const AnonymousTenant = "_anonymous"
 
 // ServerConfig configures the HTTP server.
 type ServerConfig struct {

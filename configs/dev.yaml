@@ -1,4 +1,15 @@
 # Local development config for `distlog --config configs/dev.yaml`.
+#
+# Authentication is OFF by default in this dev config (no auth section
+# below). To enable: uncomment the auth block and use the configured
+# tokens via "Authorization: Bearer <token>" on /api/ingest, /api/query,
+# and /api/logs/{docID}. /api/healthz is never gated.
+
+# auth:
+#   tokens:
+#     "tok-dev-tenant-a-32chars": "tenant-a"
+#     "tok-dev-tenant-b-32chars": "tenant-b"
+
 # All fields shown; omitting any falls back to the default applied in
 # internal/config (server) or internal/engine (engine sub-fields).
 

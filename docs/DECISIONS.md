@@ -456,3 +456,112 @@ the cond-based block.
   touching MemTable on WAL failure.
 
 ---
+
+## ADR-010: Token Auth + Tenant Scoping via AST Rewrite
+
+- **Status**: Accepted
+- **Date**: 2026-05-27
+- **Applies to**: `internal/server`, `internal/query`, `internal/config`.
+
+### Context
+
+Stage K introduces multi-tenancy: requests carry an authentication
+token whose mapping decides which tenant's data the caller can see.
+The constraints:
+
+- The storage engine is single-tenant under the hood — every record
+  already has a `TenantID` string field, but the engine does no
+  enforcement. Tenancy is purely an API-layer concern.
+- The SQL executor already supports `WHERE tenant_id = '...'`.
+- Backwards compatibility matters: existing dev setups (`configs/dev.yaml`,
+  README curl examples, the Python SDK we're about to write) must keep
+  working without modification.
+
+### Decision
+
+**Token storage.** Static map in `config.auth.tokens`: opaque bearer
+token → tenant id. No JWT, no key rotation API in this stage. Rotation
+requires a process restart. This matches the project's single-node
+operational footprint; JWT machinery would be premature.
+
+**Auth modes.** If `auth.tokens` is empty (default), the server runs
+in *auth-disabled* mode: any request with or without an Authorization
+header succeeds and is tagged as the `_anonymous` tenant. If the map
+is non-empty, all tenanted endpoints require
+`Authorization: Bearer <token>`; missing or unknown token → 401.
+`/api/healthz` is never gated (operational probe convention).
+
+**Tenant override on Write.** The server silently overwrites
+`req.tenant_id` with the token-resolved tenant. This is the security
+invariant — clients cannot forge tenancy. Silent override (rather than
+400 on mismatch) lets existing scripts that always send some `tenant_id`
+keep working when the server is in auth-disabled mode.
+
+**Tenant scoping on Read.** Two-pronged:
+
+1. `GET /api/logs/{docID}`: the handler fetches the record and, if its
+   `TenantID` does not match the caller's tenant, returns 404 (not 403).
+   404 leaks no existence information across tenants.
+2. `POST /api/query`: the handler rewrites the parsed `Statement.Where`
+   to `(caller's WHERE) AND tenant_id = '<caller tenant>'`. The rewrite
+   happens against the AST, not via string concatenation — so even if
+   a tenant id contains hostile characters they cannot escape the
+   string literal. A new helper `query.AndTenantFilter` constructs the
+   AST node; it parenthesizes the caller's WHERE so any top-level OR
+   in the caller's query retains its scope.
+
+### Why AST rewrite rather than a separate filter at the engine layer
+
+Two reasonable options for the query path:
+
+- **A (chosen):** rewrite the AST in the server, executor runs the
+  amended WHERE against `engine.Scan`.
+- **B (rejected):** add a `TenantFilter string` field to
+  `engine.ScanOptions` and filter inside the engine.
+
+A is cleaner because the engine's contract stays "I scan everything in
+ascending DocID order; the caller filters." Tenancy is an API-level
+identity, not a storage-level partition. Pushing tenancy into the
+engine would couple the storage layer to an identity model that may
+change shape (multi-tenant API keys, project hierarchies, RBAC) without
+the on-disk format changing.
+
+B would also bypass the planner — `tenant_id` is not a numeric column,
+so the existing pushdown machinery wouldn't help; the engine would just
+add yet another per-record evaluator. That work belongs to the
+executor, not the engine.
+
+### Why 404 (not 403) on cross-tenant Get
+
+403 ("forbidden") communicates that the resource exists but the caller
+lacks permission. That answers a security-relevant question: "does
+docID 42 exist in some other tenant?" Returning 404 uniformly for
+"either it doesn't exist OR it does but isn't yours" prevents
+enumeration. This is the standard pattern (GitHub, S3 with default
+deny, etc.).
+
+### Out of scope
+
+- Per-tenant rate limits, quotas, or storage isolation.
+- Tenant lifecycle (create/delete/disable) APIs. Today the set of
+  tenants is whatever's in `auth.tokens`.
+- Audit logging of authenticated requests. When structured logging
+  lands, the resolved tenant should be one of the standard fields.
+
+### Consequences
+
+- The token map is loaded once at startup. Rotating a token requires
+  editing the config file and restarting the process. For a single-node
+  dev project this is acceptable; production multi-tenant SaaS would
+  need a token store (KV or DB) and a rotation API.
+- "_anonymous" is not a reserved tenant name in storage — a customer
+  who happens to ingest with literal tenant_id "_anonymous" while
+  auth is disabled would mix with the default-mode anonymous writes.
+  Mitigation: production deployments turn auth on; dev mode is
+  best-effort.
+- Console fetches `/api/healthz` without auth (it's not gated) but
+  needs auth for `/api/query` and `/api/ingest`. The console
+  detects auth-required by probing `/api/query` on load and prompts
+  for a token only when the server actually requires one.
+
+---

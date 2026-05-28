@@ -1,5 +1,119 @@
 "use strict";
 
+// === Auth: token in sessionStorage; auto-prompt when server requires it ===
+
+const TOKEN_KEY = "distlog.token";
+let authRequired = null; // null until first probe completes
+
+function getToken() {
+  return sessionStorage.getItem(TOKEN_KEY) || "";
+}
+function setToken(t) {
+  if (t) sessionStorage.setItem(TOKEN_KEY, t);
+  else sessionStorage.removeItem(TOKEN_KEY);
+  updateAuthBar();
+}
+
+function authHeaders() {
+  const t = getToken();
+  return t ? { Authorization: "Bearer " + t } : {};
+}
+
+// apiFetch wraps fetch with the Authorization header (when set) and
+// auto-prompts for a token on 401. The retry-after-login path is
+// transparent: caller awaits one promise, login + retry happens
+// underneath.
+async function apiFetch(input, init = {}) {
+  init = Object.assign({}, init);
+  init.headers = Object.assign({}, init.headers, authHeaders());
+  let resp = await fetch(input, init);
+  if (resp.status === 401) {
+    authRequired = true;
+    updateAuthBar();
+    const got = await promptLogin();
+    if (!got) return resp;
+    init.headers = Object.assign({}, init.headers, authHeaders());
+    resp = await fetch(input, init);
+  }
+  return resp;
+}
+
+function updateAuthBar() {
+  const status = document.getElementById("auth-status");
+  const btn = document.getElementById("auth-toggle");
+  const tok = getToken();
+  if (authRequired === false) {
+    status.textContent = "auth: disabled";
+    btn.hidden = true;
+    return;
+  }
+  if (tok) {
+    status.textContent = "signed in";
+    btn.textContent = "Sign out";
+    btn.hidden = false;
+    btn.onclick = () => setToken("");
+  } else {
+    status.textContent = authRequired ? "not signed in" : "auth: checking…";
+    btn.textContent = "Sign in";
+    btn.hidden = !authRequired;
+    btn.onclick = () => promptLogin();
+  }
+}
+
+function promptLogin() {
+  return new Promise((resolve) => {
+    const dlg = document.getElementById("login-dialog");
+    const input = document.getElementById("login-token");
+    input.value = "";
+    const submit = document.getElementById("login-submit");
+    const cancel = document.getElementById("login-cancel");
+    const onSubmit = (e) => {
+      e.preventDefault();
+      const t = input.value.trim();
+      if (!t) return;
+      setToken(t);
+      dlg.close();
+      cleanup();
+      resolve(true);
+    };
+    const onCancel = () => {
+      dlg.close();
+      cleanup();
+      resolve(false);
+    };
+    const cleanup = () => {
+      submit.removeEventListener("click", onSubmit);
+      cancel.removeEventListener("click", onCancel);
+    };
+    submit.addEventListener("click", onSubmit);
+    cancel.addEventListener("click", onCancel);
+    dlg.showModal();
+    input.focus();
+  });
+}
+
+// On first load, probe /api/healthz with no headers (it's open) and
+// then probe /api/ingest with HEAD to see if auth is required. We
+// actually probe via /api/query empty (which always needs auth when
+// enabled) using a no-op fetch.
+async function detectAuthMode() {
+  try {
+    // Fire a cheap authenticated-required endpoint with no header to
+    // distinguish auth-on from auth-off.
+    const resp = await fetch("/api/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sql: "SELECT * FROM logs LIMIT 0" }),
+    });
+    authRequired = resp.status === 401;
+  } catch {
+    authRequired = false;
+  }
+  updateAuthBar();
+}
+detectAuthMode();
+updateAuthBar();
+
 // === Health panel: poll /api/healthz; rate adapts to tab visibility ===
 
 const HEALTH_FIELDS = [
@@ -227,7 +341,7 @@ document.getElementById("ingest-form").addEventListener("submit", async (e) => {
 
   const result = document.getElementById("ingest-result");
   try {
-    const resp = await fetch("/api/ingest", {
+    const resp = await apiFetch("/api/ingest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -335,7 +449,7 @@ document.getElementById("query-form").addEventListener("submit", async (e) => {
 
   const t0 = performance.now();
   try {
-    const resp = await fetch("/api/query", {
+    const resp = await apiFetch("/api/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sql }),

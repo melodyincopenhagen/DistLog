@@ -49,7 +49,19 @@ type Config struct {
 	ListenAddr          string
 	ShutdownTimeout     time.Duration
 	WriteRequestTimeout time.Duration
+
+	// Tokens maps bearer token -> tenant_id. Empty map means "auth
+	// disabled" — requests with no Authorization header succeed and
+	// are tagged as the anonymous tenant.
+	Tokens map[string]string
+	// AnonymousTenant is the tenant assigned when auth is disabled.
+	// Pass config.AnonymousTenant. Kept here so internal/server does
+	// not import internal/config.
+	AnonymousTenant string
 }
+
+// authMode reports whether at least one token is configured.
+func (c Config) authEnabled() bool { return len(c.Tokens) > 0 }
 
 // Server is the HTTP front end. New constructs one bound to an Engine;
 // Serve runs it until Shutdown is called.
@@ -59,6 +71,13 @@ type Server struct {
 	mux    *http.ServeMux
 	httpd  *http.Server
 }
+
+// ctxTenantKey is the context key that auth middleware uses to stash
+// the resolved tenant for the downstream handler. Unexported and typed
+// so it cannot collide with any other package's context keys.
+type ctxKey int
+
+const ctxTenantKey ctxKey = iota
 
 // New constructs a Server. The Engine must be Open. The Server does
 // not own the Engine — Close the Engine separately from Shutdown.
@@ -81,23 +100,77 @@ func New(cfg Config, eng *engine.Engine) *Server {
 }
 
 func (s *Server) routes() {
+	// auth wraps a handler with bearer-token resolution. Tenanted
+	// handlers — Ingest, Get, Query — go through it. Healthz does
+	// not (operational probe).
+	auth := s.authMiddleware
+
 	// Canonical /api/* routes. Console fetches these.
-	s.mux.HandleFunc("POST /api/ingest", s.handleIngest)
-	s.mux.HandleFunc("GET /api/logs/{docID}", s.handleGet)
-	s.mux.HandleFunc("POST /api/query", s.handleQuery)
+	s.mux.HandleFunc("POST /api/ingest", auth(s.handleIngest))
+	s.mux.HandleFunc("GET /api/logs/{docID}", auth(s.handleGet))
+	s.mux.HandleFunc("POST /api/query", auth(s.handleQuery))
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealth)
 
 	// Legacy unprefixed aliases. Kept indefinitely — README curl
 	// examples and any existing clients depend on them. The handlers
 	// are identical references, so semantics cannot drift.
-	s.mux.HandleFunc("POST /ingest", s.handleIngest)
-	s.mux.HandleFunc("GET /logs/{docID}", s.handleGet)
-	s.mux.HandleFunc("POST /query", s.handleQuery)
+	s.mux.HandleFunc("POST /ingest", auth(s.handleIngest))
+	s.mux.HandleFunc("GET /logs/{docID}", auth(s.handleGet))
+	s.mux.HandleFunc("POST /query", auth(s.handleQuery))
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 
 	// Static console served from embedded files. The console is a
 	// single-page vanilla-JS app; no build step.
 	s.mux.Handle("GET /", http.FileServer(http.FS(consoleFS)))
+}
+
+// authMiddleware resolves the request's tenant from the Authorization
+// header and stashes it in the request context.
+//
+//   - Auth disabled (no tokens configured): every request is accepted
+//     and tagged as cfg.AnonymousTenant. Authorization header is
+//     allowed but ignored.
+//   - Auth enabled: requests MUST present "Authorization: Bearer <t>"
+//     where t is a known token. Missing/malformed/unknown -> 401.
+//
+// Tenant is stored as a string in request context under ctxTenantKey;
+// handlers retrieve it via tenantFromCtx.
+func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var tenant string
+		if !s.cfg.authEnabled() {
+			tenant = s.cfg.AnonymousTenant
+		} else {
+			h := r.Header.Get("Authorization")
+			const prefix = "Bearer "
+			if !strings.HasPrefix(h, prefix) {
+				writeError(w, http.StatusUnauthorized, "missing or malformed Authorization: Bearer header")
+				return
+			}
+			token := h[len(prefix):]
+			t, ok := s.cfg.Tokens[token]
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "invalid token")
+				return
+			}
+			tenant = t
+		}
+		ctx := context.WithValue(r.Context(), ctxTenantKey, tenant)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// tenantFromCtx pulls the tenant the middleware resolved. The
+// middleware always sets it on every reachable handler path; the
+// fallback to AnonymousTenant defends against accidental routing
+// changes that bypass the middleware.
+func (s *Server) tenantFromCtx(r *http.Request) string {
+	if v := r.Context().Value(ctxTenantKey); v != nil {
+		if t, ok := v.(string); ok && t != "" {
+			return t
+		}
+	}
+	return s.cfg.AnonymousTenant
 }
 
 // Serve binds and serves until ctx is canceled or ListenAndServe
@@ -209,6 +282,12 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if rec.Timestamp == 0 {
 		rec.Timestamp = types.Now()
 	}
+	// Tenant override: regardless of what the client sent, the
+	// authenticated tenant wins. This is the security invariant —
+	// clients cannot forge tenancy. Silently overwriting (rather than
+	// 400'ing on mismatch) lets old scripts that don't know about
+	// auth keep working when the server is in auth-disabled mode.
+	rec.TenantID = s.tenantFromCtx(r)
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.WriteRequestTimeout)
 	defer cancel()
@@ -237,6 +316,13 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("docID %d not found", id))
+		return
+	}
+	// Tenant scope: a record belongs to one tenant. If the caller's
+	// tenant doesn't match, treat as 404 (not 403) so existence
+	// information doesn't leak across tenants.
+	if rec.TenantID != s.tenantFromCtx(r) {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("docID %d not found", id))
 		return
 	}
@@ -269,6 +355,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Tenant scope: rewrite the parsed AST so the executor's WHERE
+	// is the caller's-WHERE-AND-tenant_id-equals-callers-tenant. This
+	// happens after parse so the SQL the user typed is never modified
+	// at the string layer (no quoting / escaping concerns).
+	stmt.Where = query.AndTenantFilter(stmt.Where, s.tenantFromCtx(r))
 	// Query execution doesn't use WriteRequestTimeout — that knob is
 	// for the write path's backpressure stall. Use the request ctx
 	// directly; clients that want fail-fast set their own client-side

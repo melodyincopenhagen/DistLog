@@ -27,7 +27,37 @@ body {
   margin-right: auto;
 }
 
-header { margin-bottom: 24px; }
+header {
+  margin-bottom: 24px;
+  position: relative;
+}
+
+#auth-bar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+#auth-bar button {
+  background: var(--border);
+  color: var(--text);
+  padding: 5px 12px;
+  font-size: 12px;
+}
+
+dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 20px 24px;
+  min-width: 320px;
+  max-width: 90vw;
+}
+dialog::backdrop { background: rgba(0,0,0,0.6); }
+dialog h3 { margin: 0 0 10px 0; }
 
 h1 { margin: 0 0 4px 0; font-size: 22px; }
 h2 { margin: 0 0 12px 0; font-size: 16px; display: flex; align-items: center; gap: 12px; }

@@ -33,6 +33,9 @@ func newHarness(t *testing.T, eng *engine.Engine, cfg Config) *testHarness {
 	if cfg.WriteRequestTimeout == 0 {
 		cfg.WriteRequestTimeout = 2 * time.Second
 	}
+	if cfg.AnonymousTenant == "" {
+		cfg.AnonymousTenant = "_anonymous"
+	}
 	s := New(cfg, eng)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -96,7 +99,10 @@ func TestIngest_RoundTrip(t *testing.T) {
 	var rec logRecordResponse
 	require.NoError(t, json.NewDecoder(getResp.Body).Decode(&rec))
 	require.Equal(t, ingResp.DocID, rec.DocID)
-	require.Equal(t, "t1", rec.TenantID)
+	// Server is in auth-disabled mode (no tokens configured in this
+	// harness): tenant_id from the body is silently overridden to
+	// the anonymous tenant. Stage K invariant.
+	require.Equal(t, "_anonymous", rec.TenantID)
 	require.Equal(t, "host-1", rec.Source)
 	require.Equal(t, "hello", rec.Message)
 	require.Equal(t, "2026-05-26T12:00:00Z", rec.Timestamp)
